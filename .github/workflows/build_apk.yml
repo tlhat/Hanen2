@@ -23,8 +23,11 @@ jobs:
         with:
           channel: 'stable'
 
-      - name: Create Android Platform Files
-        run: flutter create --platforms=android --org com.haneenkids.vod .
+      - name: Create Stable Android Platform Files
+        run: |
+          # حذف المجلد القديم إن وجد وتوليد مجلد أندرويد مستقر متوافق مع إصدار فلاتر الحالي
+          rm -rf android
+          flutter create --platforms=android --org com.haneenkids.vod .
 
       - name: Configure Android Manifest Permissions for Video Streaming
         run: |
@@ -42,7 +45,7 @@ jobs:
         run: flutter pub get
 
       - name: Build Release APK
-        run: flutter build apk --release
+        run: flutter build apk --release --no-shrink
 
       - name: Upload Ready-to-Install APK Artifact
         uses: actions/upload-artifact@v4
