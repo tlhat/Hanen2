@@ -29,12 +29,13 @@ jobs:
       - name: Configure Android Manifest Permissions for Video Streaming
         run: |
           MANIFEST="android/app/src/main/AndroidManifest.xml"
-          if ! grep -q "android.permission.INTERNET" "$MANIFEST"; then
-            sed -i 's/<manifest[^>]*>/&
-    <uses-permission android:name="android.permission.INTERNET"\/>/' "$MANIFEST"
-          fi
-          if ! grep -q "usesCleartextTraffic" "$MANIFEST"; then
-            sed -i 's/<application/<application android:usesCleartextTraffic="true"/' "$MANIFEST"
+          if [ -f "$MANIFEST" ]; then
+            if ! grep -q "android.permission.INTERNET" "$MANIFEST"; then
+              sed -i '/<manifest/a \    <uses-permission android:name="android.permission.INTERNET"\/>' "$MANIFEST"
+            fi
+            if ! grep -q "usesCleartextTraffic" "$MANIFEST"; then
+              sed -i 's/<application/<application android:usesCleartextTraffic="true"/g' "$MANIFEST"
+            fi
           fi
 
       - name: Install Dependencies
