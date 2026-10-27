@@ -3,12 +3,13 @@ import 'dart:convert';
 import 'dart:math';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:flutter_tts/flutter_tts.dart';
 import 'package:http/http.dart' as http;
 import 'package:shared_preferences/shared_preferences.dart';
+import 'package:speech_to_text/speech_to_text.dart' as stt;
 import 'package:video_player/video_player.dart';
 
 const String kDefaultRemoteFeedUrl = '';
-
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -20,6 +21,206 @@ Future<void> main() async {
   runApp(HaneenKidsApp(appState: appState));
 }
 
+class CalmVoiceService {
+  static final CalmVoiceService instance = CalmVoiceService._internal();
+  CalmVoiceService._internal();
+
+  final FlutterTts _tts = FlutterTts();
+  final stt.SpeechToText _speech = stt.SpeechToText();
+  bool _ttsReady = false;
+  bool _sttReady = false;
+  bool isSpeaking = false;
+
+  Future<void> init() async {
+    if (_ttsReady) return;
+    try {
+      await _tts.setLanguage('ar-EG');
+      await _tts.setSpeechRate(0.38);
+      await _tts.setPitch(0.95);
+      await _tts.setVolume(1.0);
+      _tts.setStartHandler(() {
+        isSpeaking = true;
+      });
+      _tts.setCompletionHandler(() {
+        isSpeaking = false;
+      });
+      _tts.setErrorHandler((_) {
+        isSpeaking = false;
+      });
+      _ttsReady = true;
+    } catch (_) {
+      _ttsReady = false;
+    }
+  }
+
+  Future<void> speakCalmly(String text, {double rate = 0.38}) async {
+    try {
+      await init();
+      final String cleanText = text
+          .replaceAll('«', '')
+          .replaceAll('»', '')
+          .replaceAll('"', '')
+          .trim();
+      if (cleanText.isEmpty) return;
+      await _tts.setSpeechRate(rate);
+      await _tts.setPitch(0.95);
+      await _tts.stop();
+      await _tts.speak(cleanText);
+    } catch (_) {}
+  }
+
+  Future<void> stopSpeaking() async {
+    try {
+      await _tts.stop();
+      isSpeaking = false;
+    } catch (_) {}
+  }
+
+  Future<bool> initSpeechRecognition() async {
+    try {
+      if (_sttReady) return true;
+      _sttReady = await _speech.initialize(
+        onError: (_) {},
+        onStatus: (_) {},
+      );
+      return _sttReady;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  Future<void> startListening({
+    required void Function(String recognizedWords) onResult,
+  }) async {
+    final bool available = await initSpeechRecognition();
+    if (!available) return;
+    await stopSpeaking();
+    await _speech.listen(
+      localeId: 'ar_EG',
+      listenFor: const Duration(seconds: 8),
+      pauseFor: const Duration(seconds: 3),
+      partialResults: true,
+      onResult: (result) {
+        onResult(result.recognizedWords);
+      },
+    );
+  }
+
+  Future<void> stopListening() async {
+    try {
+      await _speech.stop();
+    } catch (_) {}
+  }
+
+  static String normalizeArabicText(String input) {
+    final RegExp diacritics =
+        RegExp(r'[\u064B-\u065F\u0670\u06D6-\u06ED«»"؛،؟!.,:\-\(\)]');
+    String cleaned = input.replaceAll(diacritics, ' ');
+    cleaned = cleaned
+        .replaceAll('أ', 'ا')
+        .replaceAll('إ', 'ا')
+        .replaceAll('آ', 'ا')
+        .replaceAll('ٱ', 'ا')
+        .replaceAll('ة', 'ه')
+        .replaceAll('ى', 'ي')
+        .replaceAll(RegExp(r'\s+'), ' ')
+        .trim();
+    return cleaned;
+  }
+
+  static PronunciationEvaluation evaluatePronunciation({
+    required String targetPhrase,
+    required String spokenText,
+  }) {
+    final String normTarget = normalizeArabicText(targetPhrase);
+    final String normSpoken = normalizeArabicText(spokenText);
+
+    final List<String> targetWords =
+        normTarget.split(' ').where((w) => w.isNotEmpty).toList();
+    final List<String> spokenWords =
+        normSpoken.split(' ').where((w) => w.isNotEmpty).toList();
+
+    if (targetWords.isEmpty) {
+      return PronunciationEvaluation(
+        accuracyScore: 1.0,
+        isCorrect: true,
+        matchedWords: const [],
+        missingOrWrongWords: const [],
+        correctionAdvice: 'أحسنت النطق يا بطل!',
+      );
+    }
+
+    if (spokenWords.isEmpty) {
+      return PronunciationEvaluation(
+        accuracyScore: 0.0,
+        isCorrect: false,
+        matchedWords: const [],
+        missingOrWrongWords: targetWords,
+        correctionAdvice:
+            'لم نسمع الجملة بوضوح، استمع إلى النطق الهادئ ثم حاول ترديد الجملة كاملة بصوت واضح.',
+      );
+    }
+
+    final List<String> matched = [];
+    final List<String> missing = [];
+
+    for (final String tWord in targetWords) {
+      bool found = false;
+      for (final String sWord in spokenWords) {
+        if (sWord == tWord ||
+            (tWord.length >= 3 &&
+                (sWord.contains(tWord) || tWord.contains(sWord)))) {
+          found = true;
+          break;
+        }
+      }
+      if (found) {
+        matched.add(tWord);
+      } else {
+        missing.add(tWord);
+      }
+    }
+
+    final double score = matched.length / targetWords.length;
+    final bool passed = score >= 0.65;
+
+    String advice;
+    if (score >= 0.95) {
+      advice = 'ما شاء الله! نطقك العربي فصيح ومتقن بنسبة ١٠٠٪ يا بطل حنين!';
+    } else if (passed) {
+      advice = missing.isEmpty
+          ? 'نطق رائع جداً! استمر على هذا الهدوء والوضوح.'
+          : 'أحسنت يا بطل! نطقك جميل جداً، ولتكون أروع انتبه لنطق كلمة (${missing.join(" ، ")}) بهدوء.';
+    } else {
+      advice =
+          'محاولة جميلة يا بطل! هيا نستمع معاً للنطق الهادئ ونركز على نطق الكلمات: (${missing.join(" ، ")}) ثم نردد معاً ببطء.';
+    }
+
+    return PronunciationEvaluation(
+      accuracyScore: score,
+      isCorrect: passed,
+      matchedWords: matched,
+      missingOrWrongWords: missing,
+      correctionAdvice: advice,
+    );
+  }
+}
+
+class PronunciationEvaluation {
+  final double accuracyScore;
+  final bool isCorrect;
+  final List<String> matchedWords;
+  final List<String> missingOrWrongWords;
+  final String correctionAdvice;
+
+  const PronunciationEvaluation({
+    required this.accuracyScore,
+    required this.isCorrect,
+    required this.matchedWords,
+    required this.missingOrWrongWords,
+    required this.correctionAdvice,
+  });
+}
 
 class VideoModel {
   final String id;
@@ -85,11 +286,13 @@ class VideoModel {
     final String rawCategory =
         (json['category'] ?? json['playlistId'] ?? 'bedtime').toString();
     return VideoModel(
-      id: (json['id'] ?? 'v_${DateTime.now().millisecondsSinceEpoch}').toString(),
+      id: (json['id'] ?? 'v_${DateTime.now().millisecondsSinceEpoch}')
+          .toString(),
       title: (json['title'] ?? 'قصة جديدة').toString(),
       description: (json['description'] ?? json['subtitle'] ?? '').toString(),
       category: rawCategory,
-      ageGroup: (json['ageGroup'] ?? json['ageRange'] ?? '3–6 سنوات').toString(),
+      ageGroup:
+          (json['ageGroup'] ?? json['ageRange'] ?? '3–6 سنوات').toString(),
       repeatPhrase: (json['repeatPhrase'] ??
               json['interactivePhrase'] ??
               '«أَنَا طِفْلٌ ذَكِيٌّ وَهَادِئٌ»')
@@ -143,6 +346,7 @@ class ChildProfile {
   String chosenAvatar;
   int usedMinutesToday;
   int watchedVideosToday;
+  int correctPronunciationsCount;
   List<String> completedActivities;
   List<String> likedVideoIds;
 
@@ -155,6 +359,7 @@ class ChildProfile {
     required this.chosenAvatar,
     this.usedMinutesToday = 0,
     this.watchedVideosToday = 0,
+    this.correctPronunciationsCount = 0,
     List<String>? completedActivities,
     List<String>? likedVideoIds,
   })  : completedActivities = completedActivities ?? [],
@@ -162,11 +367,13 @@ class ChildProfile {
 
   factory ChildProfile.fromJson(Map<String, dynamic> json) {
     return ChildProfile(
-      id: (json['id'] ?? 'child_${DateTime.now().millisecondsSinceEpoch}').toString(),
+      id: (json['id'] ?? 'child_${DateTime.now().millisecondsSinceEpoch}')
+          .toString(),
       name: (json['name'] ?? 'فارس').toString(),
       age: (json['age'] ?? json['ageGroup'] ?? '3–6 سنوات').toString(),
       dailyTimeLimit: int.tryParse(
-              (json['dailyTimeLimit'] ?? json['dailyQuota'] ?? '20').toString()) ??
+              (json['dailyTimeLimit'] ?? json['dailyQuota'] ?? '20')
+                  .toString()) ??
           20,
       starsEarned: int.tryParse(json['starsEarned']?.toString() ?? '0') ?? 0,
       chosenAvatar:
@@ -176,6 +383,9 @@ class ChildProfile {
       watchedVideosToday: int.tryParse(
               (json['watchedVideosToday'] ?? json['watchedToday'] ?? '0')
                   .toString()) ??
+          0,
+      correctPronunciationsCount: int.tryParse(
+              json['correctPronunciationsCount']?.toString() ?? '0') ??
           0,
       completedActivities: (json['completedActivities'] as List<dynamic>?)
               ?.map((e) => e.toString())
@@ -198,8 +408,288 @@ class ChildProfile {
       'chosenAvatar': chosenAvatar,
       'usedMinutesToday': usedMinutesToday,
       'watchedVideosToday': watchedVideosToday,
+      'correctPronunciationsCount': correctPronunciationsCount,
       'completedActivities': completedActivities,
       'likedVideoIds': likedVideoIds,
+    };
+  }
+}
+
+class SubscriptionPlanModel {
+  final String id;
+  final String title;
+  final String badge;
+  final String subtitle;
+  final int priceEgp;
+  final int originalPriceEgp;
+  final int durationDays;
+  final List<String> features;
+  final Color accentColor;
+  final bool isPopular;
+
+  const SubscriptionPlanModel({
+    required this.id,
+    required this.title,
+    required this.badge,
+    required this.subtitle,
+    required this.priceEgp,
+    required this.originalPriceEgp,
+    required this.durationDays,
+    required this.features,
+    required this.accentColor,
+    this.isPopular = false,
+  });
+}
+
+const List<SubscriptionPlanModel> kSubscriptionPlans = [
+  SubscriptionPlanModel(
+    id: 'trial_1day',
+    title: 'التجربة المجانية (٢٤ ساعة)',
+    badge: 'مجاني لمدة يوم كامل 🎁',
+    subtitle: 'استكشف جميع القصص والميزات الصوتية الذكية مجاناً لمدة ٢٤ ساعة',
+    priceEgp: 0,
+    originalPriceEgp: 0,
+    durationDays: 1,
+    features: [
+      'فتح جميع القصص الهادئة لمدة ٢٤ ساعة كاملة',
+      'تجربة المصحح الصوتي الذكي في نافذة «ردد معي»',
+      'تجربة المساعد الصوتي الذكي للطفل (رفيق حنين)',
+      'تقارير وتنبيهات البريد الإلكتروني للوالدين',
+    ],
+    accentColor: Color(0xFF38BDF8),
+  ),
+  SubscriptionPlanModel(
+    id: 'weekly_flex',
+    title: 'باقة الأسبوع المرنة',
+    badge: 'مرونة عالية ⚡',
+    subtitle: 'مثالية للإجازات الأسبوعية والتجربة السريعة بدون التزام طويل',
+    priceEgp: 45,
+    originalPriceEgp: 65,
+    durationDays: 7,
+    features: [
+      'مشاهدة غير محدودة لجميع الأقسام لمدة ٧ أيام',
+      'تفعيل كامل للمساعد الصوتي وتصحيح النطق العربي',
+      'إضافة حتى ٣ ملفات أطفال مستقلة',
+      'تقارير يومية واقتراحات تربوية على إيميل الوالدين',
+    ],
+    accentColor: Color(0xFF14B8A6),
+  ),
+  SubscriptionPlanModel(
+    id: 'monthly_family',
+    title: 'الباقة الشهرية الذكية',
+    badge: 'الأكثر اختياراً في مصر ⭐',
+    subtitle: 'الخيار المفضل للعائلات لمتابعة يومية هادئة وتطوير النطق والسلوك',
+    priceEgp: 120,
+    originalPriceEgp: 180,
+    durationDays: 30,
+    isPopular: true,
+    features: [
+      'فتح كافة القصص والتحديثات السحابية طوال الشهر',
+      'إضافة حتى ٥ ملفات أطفال مع تقارير أداء مفصلة',
+      'المساعد الذكي الصوتي التفاعلي وتصحيح مخارج الحروف',
+      'تنبيهات بريدية ذكية واقتراحات مخصصة لكل طفل',
+      'أولوية الدعم الفني وإمكانية الإلغاء في أي وقت',
+    ],
+    accentColor: Color(0xFFF59E0B),
+  ),
+  SubscriptionPlanModel(
+    id: 'quarterly_plus',
+    title: 'باقة الـ ٣ شهور التوفيرية',
+    badge: 'وفّر ٣٥٪ 💎',
+    subtitle: 'خطة فصلية متكاملة لبناء عادات القراءة والنطق الفصيح والهدوء',
+    priceEgp: 280,
+    originalPriceEgp: 430,
+    durationDays: 90,
+    features: [
+      'جميع مميزات الباقة الشهرية لمدة ٩٠ يوماً كاملة',
+      'برامج نطق وفصاحة متدرجة مع المساعد الصوتي',
+      'تقارير شهرية وأسبوعية شاملة عبر الإيميل للوالدين',
+      'إمكانية تخصيص مكتبة قصص خاصة لكل طفل',
+    ],
+    accentColor: Color(0xFFA855F7),
+  ),
+  SubscriptionPlanModel(
+    id: 'annual_vip',
+    title: 'باقة العائلة السنوية VIP',
+    badge: 'أفضل قيمة — وفّر ٥٥٪ 👑',
+    subtitle: 'استثمار تربوي كامل لعام كامل من القصص الهادئة والأنشطة الواقعية',
+    priceEgp: 799,
+    originalPriceEgp: 1800,
+    durationDays: 365,
+    features: [
+      'اشتراك كامل لمدة ٣٦٥ يوماً لكل أطفال العائلة بلا حدود',
+      'تفعيل دائم للمساعد الذكي الصوتي ومصحح النطق العربي',
+      'تنبيهات فورية على الإيميل واقتراحات تربوية ذكية يومية',
+      'وصول مبكر لجميع السلاسل والقصص التربوية الجديدة',
+      'هدية شهر إضافي مجاني عند التجديد',
+    ],
+    accentColor: Color(0xFFEC4899),
+  ),
+];
+
+class EgyptianPaymentMethodInfo {
+  final String id;
+  final String nameAr;
+  final String subtitleAr;
+  final String badgeText;
+  final Color brandColor;
+  final IconData icon;
+  final String merchantAccountNumber;
+
+  const EgyptianPaymentMethodInfo({
+    required this.id,
+    required this.nameAr,
+    required this.subtitleAr,
+    required this.badgeText,
+    required this.brandColor,
+    required this.icon,
+    required this.merchantAccountNumber,
+  });
+}
+
+const List<EgyptianPaymentMethodInfo> kEgyptianPaymentMethods = [
+  EgyptianPaymentMethodInfo(
+    id: 'vodafone_cash',
+    nameAr: 'فودافون كاش (Vodafone Cash)',
+    subtitleAr: 'الدفع الفوري عبر محفظة فودافون كاش (*9*7#)',
+    badgeText: 'الأسرع في مصر',
+    brandColor: Color(0xFFE60000),
+    icon: Icons.phone_android_rounded,
+    merchantAccountNumber: '0100-888-9922',
+  ),
+  EgyptianPaymentMethodInfo(
+    id: 'instapay',
+    nameAr: 'إنستا باي (InstaPay Egypt)',
+    subtitleAr: 'تحويل لحظي عبر عنوان الدفع IPA أو رقم الهاتف البنكي',
+    badgeText: 'تحويل لحظي مجاني',
+    brandColor: Color(0xFF7C3AED),
+    icon: Icons.account_balance_rounded,
+    merchantAccountNumber: 'haneenkids@instapay',
+  ),
+  EgyptianPaymentMethodInfo(
+    id: 'orange_cash',
+    nameAr: 'أورنج كاش (Orange Cash)',
+    subtitleAr: 'الدفع السريع عبر محفظة أورنج كاش (#7115#)',
+    badgeText: 'محفظة أورنج',
+    brandColor: Color(0xFFFF7900),
+    icon: Icons.smartphone_rounded,
+    merchantAccountNumber: '0122-555-7744',
+  ),
+  EgyptianPaymentMethodInfo(
+    id: 'etisalat_cash',
+    nameAr: 'اتصالات كاش (e& money / Etisalat Cash)',
+    subtitleAr: 'الدفع المباشر عبر محفظة اتصالات كاش (*777#)',
+    badgeText: 'محفظة e& money',
+    brandColor: Color(0xFF10B981),
+    icon: Icons.mobile_friendly_rounded,
+    merchantAccountNumber: '0111-333-8855',
+  ),
+  EgyptianPaymentMethodInfo(
+    id: 'visa_mastercard',
+    nameAr: 'بطاقة بنكية (فيزا / ماستركارد / ميزة)',
+    subtitleAr: 'دفع آمن بالبطاقات البنكية المصرية وبطاقات ميزة الوطنية',
+    badgeText: 'Visa / Meeza',
+    brandColor: Color(0xFF2563EB),
+    icon: Icons.credit_card_rounded,
+    merchantAccountNumber: 'بوابة الدفع الإلكتروني المؤمنة 3D-Secure',
+  ),
+];
+
+class PaymentTransactionRecord {
+  final String id;
+  final String planId;
+  final String planTitle;
+  final int amountEgp;
+  final String paymentMethodId;
+  final String paymentMethodName;
+  final String payerIdentifier;
+  final String referenceCode;
+  final DateTime createdAt;
+
+  PaymentTransactionRecord({
+    required this.id,
+    required this.planId,
+    required this.planTitle,
+    required this.amountEgp,
+    required this.paymentMethodId,
+    required this.paymentMethodName,
+    required this.payerIdentifier,
+    required this.referenceCode,
+    required this.createdAt,
+  });
+
+  factory PaymentTransactionRecord.fromJson(Map<String, dynamic> json) {
+    return PaymentTransactionRecord(
+      id: (json['id'] ?? '').toString(),
+      planId: (json['planId'] ?? '').toString(),
+      planTitle: (json['planTitle'] ?? '').toString(),
+      amountEgp: int.tryParse(json['amountEgp']?.toString() ?? '0') ?? 0,
+      paymentMethodId: (json['paymentMethodId'] ?? '').toString(),
+      paymentMethodName: (json['paymentMethodName'] ?? '').toString(),
+      payerIdentifier: (json['payerIdentifier'] ?? '').toString(),
+      referenceCode: (json['referenceCode'] ?? '').toString(),
+      createdAt: DateTime.tryParse(json['createdAt']?.toString() ?? '') ??
+          DateTime.now(),
+    );
+  }
+
+  Map<String, dynamic> toJson() {
+    return {
+      'id': id,
+      'planId': planId,
+      'planTitle': planTitle,
+      'amountEgp': amountEgp,
+      'paymentMethodId': paymentMethodId,
+      'paymentMethodName': paymentMethodName,
+      'payerIdentifier': payerIdentifier,
+      'referenceCode': referenceCode,
+      'createdAt': createdAt.toIso8601String(),
+    };
+  }
+}
+
+class ParentEmailAlertItem {
+  final String id;
+  final String recipientEmail;
+  final String subject;
+  final String bodyMessage;
+  final String smartImprovementSuggestion;
+  final DateTime sentAt;
+  final bool deliveredToCloud;
+
+  ParentEmailAlertItem({
+    required this.id,
+    required this.recipientEmail,
+    required this.subject,
+    required this.bodyMessage,
+    required this.smartImprovementSuggestion,
+    required this.sentAt,
+    this.deliveredToCloud = true,
+  });
+
+  factory ParentEmailAlertItem.fromJson(Map<String, dynamic> json) {
+    return ParentEmailAlertItem(
+      id: (json['id'] ?? '').toString(),
+      recipientEmail: (json['recipientEmail'] ?? '').toString(),
+      subject: (json['subject'] ?? '').toString(),
+      bodyMessage: (json['bodyMessage'] ?? '').toString(),
+      smartImprovementSuggestion:
+          (json['smartImprovementSuggestion'] ?? '').toString(),
+      sentAt: DateTime.tryParse(json['sentAt']?.toString() ?? '') ??
+          DateTime.now(),
+      deliveredToCloud: json['deliveredToCloud'] != false,
+    );
+  }
+
+  Map<String, dynamic> toJson() {
+    return {
+      'id': id,
+      'recipientEmail': recipientEmail,
+      'subject': subject,
+      'bodyMessage': bodyMessage,
+      'smartImprovementSuggestion': smartImprovementSuggestion,
+      'sentAt': sentAt.toIso8601String(),
+      'deliveredToCloud': deliveredToCloud,
     };
   }
 }
@@ -209,19 +699,41 @@ class ParentAccount {
   String emailOrPhone;
   String password;
   String parentalPin;
+  String authProvider;
   bool warmEveningFilter;
+  bool emailNotificationsEnabled;
+  bool dailySmartSuggestionsEnabled;
+  bool voiceAssistantEnabled;
+  String subscriptionPlanId;
+  DateTime trialStartDate;
+  DateTime subscriptionExpiryDate;
   List<ChildProfile> children;
   String activeChildId;
+  List<PaymentTransactionRecord> paymentHistory;
+  List<ParentEmailAlertItem> emailAlertsLog;
 
   ParentAccount({
     required this.fullName,
     required this.emailOrPhone,
     required this.password,
     this.parentalPin = '1234',
+    this.authProvider = 'email',
     this.warmEveningFilter = false,
+    this.emailNotificationsEnabled = true,
+    this.dailySmartSuggestionsEnabled = true,
+    this.voiceAssistantEnabled = true,
+    this.subscriptionPlanId = 'trial_1day',
+    DateTime? trialStartDate,
+    DateTime? subscriptionExpiryDate,
     required this.children,
     required this.activeChildId,
-  });
+    List<PaymentTransactionRecord>? paymentHistory,
+    List<ParentEmailAlertItem>? emailAlertsLog,
+  })  : trialStartDate = trialStartDate ?? DateTime.now(),
+        subscriptionExpiryDate = subscriptionExpiryDate ??
+            DateTime.now().add(const Duration(hours: 24)),
+        paymentHistory = paymentHistory ?? [],
+        emailAlertsLog = emailAlertsLog ?? [];
 
   ChildProfile get activeChild {
     if (children.isEmpty) {
@@ -241,6 +753,33 @@ class ParentAccount {
     );
   }
 
+  bool get isTrialPlan => subscriptionPlanId == 'trial_1day';
+
+  bool get isSubscriptionActive =>
+      DateTime.now().isBefore(subscriptionExpiryDate);
+
+  Duration get remainingSubscriptionDuration {
+    final diff = subscriptionExpiryDate.difference(DateTime.now());
+    return diff.isNegative ? Duration.zero : diff;
+  }
+
+  String get subscriptionStatusLabel {
+    if (!isSubscriptionActive) {
+      return 'انتهت الفترة التجريبية (يرجى اختيار باقة لتجديد الاشتراك)';
+    }
+    final rem = remainingSubscriptionDuration;
+    if (isTrialPlan) {
+      final int hours = rem.inHours;
+      final int mins = rem.inMinutes.remainder(60);
+      return 'فترة تجريبية مجانية (متبقي $hours ساعة و $mins دقيقة)';
+    }
+    final plan = kSubscriptionPlans.firstWhere(
+      (p) => p.id == subscriptionPlanId,
+      orElse: () => kSubscriptionPlans[2],
+    );
+    return '${plan.title} — سارية (${rem.inDays + 1} يوم متبقي)';
+  }
+
   factory ParentAccount.fromJson(Map<String, dynamic> json) {
     final childrenList = (json['children'] as List<dynamic>?)
             ?.map((c) =>
@@ -255,16 +794,47 @@ class ParentAccount {
             chosenAvatar: '🦁',
           ),
         ];
+
+    final payments = (json['paymentHistory'] as List<dynamic>?)
+            ?.map((p) => PaymentTransactionRecord.fromJson(
+                Map<String, dynamic>.from(p as Map)))
+            .toList() ??
+        [];
+
+    final alerts = (json['emailAlertsLog'] as List<dynamic>?)
+            ?.map((a) => ParentEmailAlertItem.fromJson(
+                Map<String, dynamic>.from(a as Map)))
+            .toList() ??
+        [];
+
+    final DateTime parsedTrialStart =
+        DateTime.tryParse(json['trialStartDate']?.toString() ?? '') ??
+            DateTime.now();
+    final DateTime parsedExpiry =
+        DateTime.tryParse(json['subscriptionExpiryDate']?.toString() ?? '') ??
+            parsedTrialStart.add(const Duration(hours: 24));
+
     return ParentAccount(
       fullName: (json['fullName'] ?? 'ولي الأمر').toString(),
       emailOrPhone: (json['emailOrPhone'] ?? '').toString(),
       password: (json['password'] ?? '').toString(),
       parentalPin: (json['parentalPin'] ?? '1234').toString(),
+      authProvider: (json['authProvider'] ?? 'email').toString(),
       warmEveningFilter:
           json['warmEveningFilter'] == true || json['bedtimeDimming'] == true,
+      emailNotificationsEnabled: json['emailNotificationsEnabled'] != false,
+      dailySmartSuggestionsEnabled:
+          json['dailySmartSuggestionsEnabled'] != false,
+      voiceAssistantEnabled: json['voiceAssistantEnabled'] != false,
+      subscriptionPlanId:
+          (json['subscriptionPlanId'] ?? 'trial_1day').toString(),
+      trialStartDate: parsedTrialStart,
+      subscriptionExpiryDate: parsedExpiry,
       children: childrenList,
       activeChildId:
           (json['activeChildId'] ?? childrenList.first.id).toString(),
+      paymentHistory: payments,
+      emailAlertsLog: alerts,
     );
   }
 
@@ -274,9 +844,18 @@ class ParentAccount {
       'emailOrPhone': emailOrPhone,
       'password': password,
       'parentalPin': parentalPin,
+      'authProvider': authProvider,
       'warmEveningFilter': warmEveningFilter,
+      'emailNotificationsEnabled': emailNotificationsEnabled,
+      'dailySmartSuggestionsEnabled': dailySmartSuggestionsEnabled,
+      'voiceAssistantEnabled': voiceAssistantEnabled,
+      'subscriptionPlanId': subscriptionPlanId,
+      'trialStartDate': trialStartDate.toIso8601String(),
+      'subscriptionExpiryDate': subscriptionExpiryDate.toIso8601String(),
       'children': children.map((c) => c.toJson()).toList(),
       'activeChildId': activeChildId,
+      'paymentHistory': paymentHistory.map((p) => p.toJson()).toList(),
+      'emailAlertsLog': emailAlertsLog.map((a) => a.toJson()).toList(),
     };
   }
 }
@@ -392,8 +971,13 @@ class AppStateManager extends ChangeNotifier {
   List<VideoModel> videos = [];
   String remoteFeedUrl = kDefaultRemoteFeedUrl;
   String authApiUrl = '';
+  String emailWebhookUrl = '';
   bool isSyncingVideos = false;
   String? lastSyncMessage;
+
+  String currentAssistantBannerMessage =
+      'مرحباً يا بطل! أنا رفيق حنين الذكي، اضغط عليّ لأقرأ لك أو أقترح عليك قصة ممتعة!';
+  VideoModel? suggestedVideoForChild;
 
   Timer? _screenTimeTimer;
   int _activeSessionSeconds = 0;
@@ -401,9 +985,12 @@ class AppStateManager extends ChangeNotifier {
   AppStateManager(this._prefs);
 
   Future<void> initialize() async {
+    await CalmVoiceService.instance.init();
     onboardingCompleted = _prefs.getBool('onboarding_completed') ?? false;
-    remoteFeedUrl = _prefs.getString('remote_feed_url') ?? kDefaultRemoteFeedUrl;
+    remoteFeedUrl =
+        _prefs.getString('remote_feed_url') ?? kDefaultRemoteFeedUrl;
     authApiUrl = _prefs.getString('auth_api_url') ?? '';
+    emailWebhookUrl = _prefs.getString('email_webhook_url') ?? '';
 
     final String? accountsJson = _prefs.getString('registered_accounts_v2');
     if (accountsJson != null && accountsJson.isNotEmpty) {
@@ -417,12 +1004,16 @@ class AppStateManager extends ChangeNotifier {
     }
 
     if (!_accounts.containsKey('parent@haneenkids.com')) {
-      _accounts['parent@haneenkids.com'] = ParentAccount(
+      final demoAccount = ParentAccount(
         fullName: 'أبو فارس (حساب تجريبي)',
         emailOrPhone: 'parent@haneenkids.com',
         password: '123456',
         parentalPin: '1234',
+        authProvider: 'demo',
         warmEveningFilter: false,
+        subscriptionPlanId: 'trial_1day',
+        trialStartDate: DateTime.now(),
+        subscriptionExpiryDate: DateTime.now().add(const Duration(hours: 24)),
         children: [
           ChildProfile(
             id: 'child_faris',
@@ -432,7 +1023,8 @@ class AppStateManager extends ChangeNotifier {
             starsEarned: 4,
             chosenAvatar: '🦁',
             usedMinutesToday: 0,
-            watchedVideosToday: 0,
+            watchedVideosToday: 1,
+            correctPronunciationsCount: 2,
           ),
           ChildProfile(
             id: 'child_noor',
@@ -442,11 +1034,26 @@ class AppStateManager extends ChangeNotifier {
             starsEarned: 6,
             chosenAvatar: '🦋',
             usedMinutesToday: 0,
-            watchedVideosToday: 0,
+            watchedVideosToday: 2,
+            correctPronunciationsCount: 3,
           ),
         ],
         activeChildId: 'child_faris',
       );
+      demoAccount.emailAlertsLog.add(
+        ParentEmailAlertItem(
+          id: 'alert_welcome',
+          recipientEmail: 'parent@haneenkids.com',
+          subject:
+              '🎉 مرحباً بك في حنين كيدز — بدأت فترتك التجريبية المجانية (٢٤ ساعة)',
+          bodyMessage:
+              'تم تفعيل حسابك بنجاح مع فترة تجريبية مجانية لمدة يوم كامل (٢٤ ساعة). يمكنك متابعة تقدم فارس ونور في الفصاحة والأنشطة الواقعية من بوابة الوالدين.',
+          smartImprovementSuggestion:
+              '💡 اقتراح لتحسين التجربة: فعّل «فلتر المساء الدافئ» قبل موعد نوم الطفل بنصف ساعة، وشجّع طفلك على استخدام زر «ردد معي» الصوتي لكسب نجوم الفصاحة.',
+          sentAt: DateTime.now(),
+        ),
+      );
+      _accounts['parent@haneenkids.com'] = demoAccount;
       await _saveAccounts();
     }
 
@@ -473,6 +1080,7 @@ class AppStateManager extends ChangeNotifier {
     }
 
     _syncLikedStateForActiveChild();
+    _refreshSmartVoiceAssistantSuggestion(speakAloud: false);
     _startScreenTimeTracker();
     isInitialized = true;
     notifyListeners();
@@ -490,6 +1098,21 @@ class AppStateManager extends ChangeNotifier {
         if (child.usedMinutesToday < child.dailyTimeLimit) {
           child.usedMinutesToday++;
           _activeSessionSeconds += 60;
+          final int remaining = child.dailyTimeLimit - child.usedMinutesToday;
+          if (remaining == 5 && currentAccount!.voiceAssistantEnabled) {
+            final msg =
+                'تنبيه لطيف يا ${child.name}، بقيت خمس دقائق فقط في وقت المشاهدة اليومي، استعد لنشاط البطل!';
+            currentAssistantBannerMessage = msg;
+            CalmVoiceService.instance.speakCalmly(msg);
+          } else if (remaining <= 0) {
+            sendParentEmailAlert(
+              subject:
+                  '🌙 إشعار حنين كيدز: انتهاء الحصة اليومية للطفل ${child.name}',
+              bodyMessage:
+                  'أكمل الطفل ${child.name} حصته اليومية المحددة (${child.dailyTimeLimit} دقيقة) وتم إسدال ستارة النوم الهادئة تلقائياً.',
+              customSuggestion: generateSmartParentRecommendation(),
+            );
+          }
           _saveAccounts();
           notifyListeners();
         }
@@ -503,6 +1126,111 @@ class AppStateManager extends ChangeNotifier {
     final child = currentAccount?.activeChild;
     if (child == null) return false;
     return child.usedMinutesToday >= child.dailyTimeLimit;
+  }
+
+  bool get isSubscriptionExpired {
+    if (currentAccount == null) return false;
+    return !currentAccount!.isSubscriptionActive;
+  }
+
+  String generateSmartParentRecommendation() {
+    final account = currentAccount;
+    if (account == null) {
+      return '💡 خصص ١٥ دقيقة يومياً لمشاركة طفلك قصة من قسم الفصاحة والنطق.';
+    }
+    final child = account.activeChild;
+    final int hour = DateTime.now().hour;
+
+    if (hour >= 18 && !account.warmEveningFilter) {
+      return '🌙 اقتراح المساء: نلاحظ أن وقت المشاهدة مسائي؛ ننصح بتفعيل «فلتر المساء الدافئ» واختيار قسم «قصص النوم» لتهدئة الطفل قبل النوم.';
+    }
+    if (child.correctPronunciationsCount < 2) {
+      return '🗣️ اقتراح تطوير النطق: شجّع ${child.name} على الضغط على زر «ردد معي» في قصص «فصاحة ونطق» ليستمع للمصحح الصوتي الهادئ ويطور مخارج الحروف.';
+    }
+    if (child.completedActivities.length < 2) {
+      return '🎯 اقتراح التوازن الحركي: بعد انتهاء القصة القادمة، افتح نافذة «نشاط البطل الواقعي» مع ${child.name} لتنفيذ مهمة حركية خارج الشاشة.';
+    }
+    return '🌟 أداء رائع! ${child.name} يتفاعل بانتظام؛ نقترح تجربة قصص «لماذا وكيف؟» لتنمية الفضول العلمي والتفكير الهادئ.';
+  }
+
+  void _refreshSmartVoiceAssistantSuggestion({bool speakAloud = false}) {
+    if (videos.isEmpty) return;
+    final child = currentAccount?.activeChild;
+    final String childName = child?.name ?? 'يا بطل';
+    final int hour = DateTime.now().hour;
+
+    VideoModel candidate = videos.first;
+    String greeting;
+
+    if (hour >= 19) {
+      candidate = videos.firstWhere(
+        (v) => v.category == 'bedtime',
+        orElse: () => videos.first,
+      );
+      greeting =
+          'مساء الهدوء يا $childName! أنا مساعدك الذكي، أقترح عليك مشاهدة قصة «${candidate.title}» للاستعداد لنوم هادئ وجميل.';
+    } else if ((child?.correctPronunciationsCount ?? 0) < 2) {
+      candidate = videos.firstWhere(
+        (v) => v.category == 'arabic',
+        orElse: () => videos.first,
+      );
+      greeting =
+          'أهلاً يا $childName! هيا نشاهد قصة «${candidate.title}» ونتدرب معاً بصوتي الهادئ على نطق الجملة الفصيحة!';
+    } else {
+      final randomIndex = Random().nextInt(videos.length);
+      candidate = videos[randomIndex];
+      greeting =
+          'مرحباً يا $childName! لدي اقتراح رائع لك اليوم: قصة «${candidate.title}»، وبعدها سنلعب معاً نشاط البطل الواقعي!';
+    }
+
+    suggestedVideoForChild = candidate;
+    currentAssistantBannerMessage = greeting;
+    if (speakAloud && (currentAccount?.voiceAssistantEnabled ?? true)) {
+      CalmVoiceService.instance.speakCalmly(greeting);
+    }
+    notifyListeners();
+  }
+
+  void triggerVoiceAssistantGreetingAndSuggestion() {
+    _refreshSmartVoiceAssistantSuggestion(speakAloud: true);
+  }
+
+  Future<void> sendParentEmailAlert({
+    required String subject,
+    required String bodyMessage,
+    String? customSuggestion,
+  }) async {
+    final account = currentAccount;
+    if (account == null) return;
+    final String suggestion =
+        customSuggestion ?? generateSmartParentRecommendation();
+
+    final alert = ParentEmailAlertItem(
+      id: 'mail_${DateTime.now().millisecondsSinceEpoch}',
+      recipientEmail: account.emailOrPhone,
+      subject: subject,
+      bodyMessage: bodyMessage,
+      smartImprovementSuggestion: suggestion,
+      sentAt: DateTime.now(),
+      deliveredToCloud: true,
+    );
+
+    account.emailAlertsLog.insert(0, alert);
+
+    if (emailWebhookUrl.trim().isNotEmpty) {
+      try {
+        await http
+            .post(
+              Uri.parse(emailWebhookUrl.trim()),
+              headers: {'Content-Type': 'application/json; charset=utf-8'},
+              body: jsonEncode(alert.toJson()),
+            )
+            .timeout(const Duration(seconds: 8));
+      } catch (_) {}
+    }
+
+    await _saveAccounts();
+    notifyListeners();
   }
 
   Future<void> completeOnboarding() async {
@@ -560,6 +1288,7 @@ class AppStateManager extends ChangeNotifier {
             await _prefs.setString('current_user_key', key);
             await _prefs.setBool('has_selected_child_in_session', true);
             _syncLikedStateForActiveChild();
+            _refreshSmartVoiceAssistantSuggestion(speakAloud: false);
             notifyListeners();
             return null;
           }
@@ -569,9 +1298,9 @@ class AppStateManager extends ChangeNotifier {
 
     final account = _accounts[key];
     if (account == null) {
-      return 'لا يوجد حساب مسجل بهذا البريد أو الهاتف. أنشئ حساباً جديداً أولاً.';
+      return 'لا يوجد حساب مسجل بهذا البريد أو الهاتف. أنشئ حساباً جديداً أو سجل بحساب جوجل.';
     }
-    if (account.password != password) {
+    if (account.password != password && account.authProvider != 'google') {
       return 'كلمة المرور غير صحيحة، يرجى المحاولة مرة أخرى.';
     }
 
@@ -580,6 +1309,88 @@ class AppStateManager extends ChangeNotifier {
     await _prefs.setString('current_user_key', key);
     await _prefs.setBool('has_selected_child_in_session', true);
     _syncLikedStateForActiveChild();
+    _refreshSmartVoiceAssistantSuggestion(speakAloud: false);
+    notifyListeners();
+    return null;
+  }
+
+  Future<String?> signInOrSignUpWithGoogle({
+    required String googleEmail,
+    required String googleDisplayName,
+    required String parentalPin,
+    required String childName,
+    required String childAgeGroup,
+    required String childAvatar,
+    required int dailyTimeLimit,
+  }) async {
+    final key = googleEmail.trim().toLowerCase();
+    if (key.isEmpty || !key.contains('@')) {
+      return 'يرجى اختيار أو إدخال بريد حساب Google صحيح (مثل name@gmail.com).';
+    }
+
+    if (_accounts.containsKey(key)) {
+      currentAccount = _accounts[key];
+      onboardingCompleted = true;
+      hasSelectedChildInSession = true;
+      await _prefs.setBool('onboarding_completed', true);
+      await _prefs.setString('current_user_key', key);
+      await _prefs.setBool('has_selected_child_in_session', true);
+      _syncLikedStateForActiveChild();
+      _refreshSmartVoiceAssistantSuggestion(speakAloud: false);
+      await sendParentEmailAlert(
+        subject: '🔐 تسجيل دخول ناجح عبر حساب جوجل — حنين كيدز',
+        bodyMessage:
+            'تم تسجيل الدخول إلى حسابك ($key) عبر مصادقة Google بنجاح.',
+      );
+      notifyListeners();
+      return null;
+    }
+
+    final firstChild = ChildProfile(
+      id: 'child_${DateTime.now().millisecondsSinceEpoch}',
+      name: childName.trim().isEmpty ? 'بطل حنين' : childName.trim(),
+      age: childAgeGroup,
+      dailyTimeLimit: dailyTimeLimit,
+      chosenAvatar: childAvatar,
+    );
+
+    final now = DateTime.now();
+    final newAccount = ParentAccount(
+      fullName: googleDisplayName.trim().isEmpty
+          ? 'ولي أمر (${key.split('@').first})'
+          : googleDisplayName.trim(),
+      emailOrPhone: key,
+      password: 'google_oauth_${now.millisecondsSinceEpoch}',
+      parentalPin: parentalPin.trim().length == 4 ? parentalPin.trim() : '1234',
+      authProvider: 'google',
+      warmEveningFilter: false,
+      subscriptionPlanId: 'trial_1day',
+      trialStartDate: now,
+      subscriptionExpiryDate: now.add(const Duration(hours: 24)),
+      children: [firstChild],
+      activeChildId: firstChild.id,
+    );
+
+    _accounts[key] = newAccount;
+    currentAccount = newAccount;
+    onboardingCompleted = true;
+    hasSelectedChildInSession = true;
+    await _saveAccounts();
+    await _prefs.setBool('onboarding_completed', true);
+    await _prefs.setString('current_user_key', key);
+    await _prefs.setBool('has_selected_child_in_session', true);
+    _syncLikedStateForActiveChild();
+    _refreshSmartVoiceAssistantSuggestion(speakAloud: false);
+
+    await sendParentEmailAlert(
+      subject:
+          '🎁 مرحباً بك عبر Google في حنين كيدز — بدأت تجربتك المجانية (٢٤ ساعة)',
+      bodyMessage:
+          'أهلاً بك يا ${newAccount.fullName}! تم ربط حساب جوجل ($key) وإنشاء ملف الطفل (${firstChild.name}) مع تفعيل تجربة مجانية شاملة لمدة ٢٤ ساعة.',
+      customSuggestion:
+          '💡 نصيحة اليوم الأول: جرب مع ${firstChild.name} ميزة «ردد معي» الصوتية ومساعد حنين الذكي لاكتشاف القصص الأنسب لعمره (${firstChild.age}).',
+    );
+
     notifyListeners();
     return null;
   }
@@ -619,12 +1430,17 @@ class AppStateManager extends ChangeNotifier {
       chosenAvatar: childAvatar,
     );
 
+    final now = DateTime.now();
     final newAccount = ParentAccount(
       fullName: fullName.trim(),
       emailOrPhone: key,
       password: password,
       parentalPin: parentalPin.trim(),
+      authProvider: 'email',
       warmEveningFilter: false,
+      subscriptionPlanId: 'trial_1day',
+      trialStartDate: now,
+      subscriptionExpiryDate: now.add(const Duration(hours: 24)),
       children: [firstChild],
       activeChildId: firstChild.id,
     );
@@ -636,8 +1452,81 @@ class AppStateManager extends ChangeNotifier {
     await _prefs.setString('current_user_key', key);
     await _prefs.setBool('has_selected_child_in_session', true);
     _syncLikedStateForActiveChild();
+    _refreshSmartVoiceAssistantSuggestion(speakAloud: false);
+
+    await sendParentEmailAlert(
+      subject:
+          '🎉 مرحباً بك في حنين كيدز — تفعيل التجربة المجانية لمدة يوم كامل (٢٤ ساعة)',
+      bodyMessage:
+          'تم إنشاء حساب الوالدين ($key) وتخصيص ملف الطفل (${firstChild.name}). لديك الآن ٢٤ ساعة مجانية لاستكشاف كافة المميزات قبل اختيار باقة الاشتراك المناسبة.',
+    );
+
     notifyListeners();
     return null;
+  }
+
+  Future<PaymentTransactionRecord?> processEgyptianSubscriptionPayment({
+    required SubscriptionPlanModel plan,
+    required EgyptianPaymentMethodInfo method,
+    required String payerIdentifier,
+  }) async {
+    final account = currentAccount;
+    if (account == null) return null;
+
+    final now = DateTime.now();
+    final DateTime baseDate = account.subscriptionExpiryDate.isAfter(now)
+        ? account.subscriptionExpiryDate
+        : now;
+
+    account.subscriptionPlanId = plan.id;
+    account.subscriptionExpiryDate =
+        baseDate.add(Duration(days: plan.durationDays));
+
+    final String refCode =
+        'EG-${method.id.substring(0, 3).toUpperCase()}-${100000 + Random().nextInt(899999)}';
+
+    final tx = PaymentTransactionRecord(
+      id: 'tx_${now.millisecondsSinceEpoch}',
+      planId: plan.id,
+      planTitle: plan.title,
+      amountEgp: plan.priceEgp,
+      paymentMethodId: method.id,
+      paymentMethodName: method.nameAr,
+      payerIdentifier: payerIdentifier.trim(),
+      referenceCode: refCode,
+      createdAt: now,
+    );
+
+    account.paymentHistory.insert(0, tx);
+
+    await sendParentEmailAlert(
+      subject:
+          '✅ إيصال تفعيل اشتراك حنين كيدز (${plan.title}) عبر ${method.nameAr}',
+      bodyMessage:
+          'تم بنجاح تأكيد عملية الدفع بقيمة ${plan.priceEgp} جنيه مصري عبر ${method.nameAr} (رقم مرجعي: $refCode). اشتراكك سارٍ الآن حتى ${account.subscriptionExpiryDate.toLocal().toString().split(" ").first}.',
+      customSuggestion:
+          '💡 نصيحة بعد الاشتراك: يمكنك الآن إضافة ملفات لجميع أطفالك في العائلة وتخصيص وقت المشاهدة اليومي لكل طفل على حدة.',
+    );
+
+    await _saveAccounts();
+    notifyListeners();
+    return tx;
+  }
+
+  Future<void> activateOrResetOneDayTrial() async {
+    final account = currentAccount;
+    if (account == null) return;
+    account.subscriptionPlanId = 'trial_1day';
+    account.trialStartDate = DateTime.now();
+    account.subscriptionExpiryDate =
+        DateTime.now().add(const Duration(hours: 24));
+    await sendParentEmailAlert(
+      subject: '🎁 تم تفعيل يوم تجريبي مجاني جديد (٢٤ ساعة) في حنين كيدز',
+      bodyMessage:
+          'تم منح حسابك ٢٤ ساعة تجريبية مجانية إضافية للاستمتاع بجميع القصص والميزات الصوتية الذكية.',
+    );
+    await _saveAccounts();
+    notifyListeners();
   }
 
   Future<String?> resetPassword({
@@ -669,7 +1558,32 @@ class AppStateManager extends ChangeNotifier {
     notifyListeners();
   }
 
+  Future<void> toggleParentEmailNotifications(bool enabled) async {
+    if (currentAccount == null) return;
+    currentAccount!.emailNotificationsEnabled = enabled;
+    await _saveAccounts();
+    notifyListeners();
+  }
+
+  Future<void> toggleDailySmartSuggestions(bool enabled) async {
+    if (currentAccount == null) return;
+    currentAccount!.dailySmartSuggestionsEnabled = enabled;
+    await _saveAccounts();
+    notifyListeners();
+  }
+
+  Future<void> toggleVoiceAssistant(bool enabled) async {
+    if (currentAccount == null) return;
+    currentAccount!.voiceAssistantEnabled = enabled;
+    if (!enabled) {
+      await CalmVoiceService.instance.stopSpeaking();
+    }
+    await _saveAccounts();
+    notifyListeners();
+  }
+
   Future<void> logout() async {
+    await CalmVoiceService.instance.stopSpeaking();
     currentAccount = null;
     hasSelectedChildInSession = false;
     await _prefs.remove('current_user_key');
@@ -688,6 +1602,7 @@ class AppStateManager extends ChangeNotifier {
     currentAccount!.activeChildId = childId;
     hasSelectedChildInSession = true;
     _syncLikedStateForActiveChild();
+    _refreshSmartVoiceAssistantSuggestion(speakAloud: true);
     await _saveAccounts();
     await _prefs.setBool('has_selected_child_in_session', true);
     notifyListeners();
@@ -697,6 +1612,7 @@ class AppStateManager extends ChangeNotifier {
     if (currentAccount == null) return;
     currentAccount!.activeChildId = childId;
     _syncLikedStateForActiveChild();
+    _refreshSmartVoiceAssistantSuggestion(speakAloud: false);
     await _saveAccounts();
     notifyListeners();
   }
@@ -786,12 +1702,27 @@ class AppStateManager extends ChangeNotifier {
     notifyListeners();
   }
 
-  Future<void> awardStarAndRecordActivity(String activityKey) async {
+  Future<void> awardStarAndRecordActivity(
+    String activityKey, {
+    bool isPronunciation = false,
+  }) async {
     if (currentAccount == null) return;
     final child = currentAccount!.activeChild;
     child.starsEarned++;
+    if (isPronunciation) {
+      child.correctPronunciationsCount++;
+    }
     if (!child.completedActivities.contains(activityKey)) {
       child.completedActivities.add(activityKey);
+    }
+    if (currentAccount!.emailNotificationsEnabled &&
+        child.starsEarned % 3 == 0) {
+      await sendParentEmailAlert(
+        subject:
+            '🌟 إنجاز جديد للبطل ${child.name} — وصل إلى ${child.starsEarned} نجوم!',
+        bodyMessage:
+            'أحرز ${child.name} تقدماً رائعاً في الفصاحة والأنشطة التربوية وجمع الآن ${child.starsEarned} نجوم.',
+      );
     }
     await _saveAccounts();
     notifyListeners();
@@ -840,6 +1771,12 @@ class AppStateManager extends ChangeNotifier {
   Future<void> updateAuthApiUrl(String url) async {
     authApiUrl = url.trim();
     await _prefs.setString('auth_api_url', authApiUrl);
+    notifyListeners();
+  }
+
+  Future<void> updateEmailWebhookUrl(String url) async {
+    emailWebhookUrl = url.trim();
+    await _prefs.setString('email_webhook_url', emailWebhookUrl);
     notifyListeners();
   }
 
@@ -918,8 +1855,8 @@ class AppStateManager extends ChangeNotifier {
 
   String exportVideosAsJson() {
     final map = {
-      'app': 'Haneen Kids v2.0',
-      'version': 2,
+      'app': 'Haneen Kids v2.5',
+      'version': 25,
       'updatedAt': DateTime.now().toIso8601String(),
       'videos': videos.map((v) => v.toJson()).toList(),
     };
@@ -933,7 +1870,6 @@ class AppStateManager extends ChangeNotifier {
   }
 }
 
-
 class HaneenKidsApp extends StatelessWidget {
   final AppStateManager appState;
   const HaneenKidsApp({super.key, required this.appState});
@@ -944,7 +1880,7 @@ class HaneenKidsApp extends StatelessWidget {
       animation: appState,
       builder: (context, _) {
         return MaterialApp(
-          title: 'حنين كيدز (Haneen Kids v2.0)',
+          title: 'حنين كيدز (Haneen Kids v2.5)',
           debugShowCheckedModeBanner: false,
           theme: ThemeData.dark().copyWith(
             scaffoldBackgroundColor: const Color(0xFF0F172A),
@@ -985,7 +1921,6 @@ class HaneenKidsApp extends StatelessWidget {
     );
   }
 }
-
 
 class SplashRouterScreen extends StatefulWidget {
   final AppStateManager appState;
@@ -1059,7 +1994,7 @@ class SplashScreen extends StatelessWidget {
               ),
               const SizedBox(height: 20),
               const Text(
-                'حنين كيدز (Haneen Kids v2.0)',
+                'حنين كيدز (Haneen Kids)',
                 style: TextStyle(
                   fontSize: 28,
                   fontWeight: FontWeight.bold,
@@ -1068,8 +2003,8 @@ class SplashScreen extends StatelessWidget {
               ),
               const SizedBox(height: 8),
               const Text(
-                'مشاهدة هادئة • فطام ذكي • أنشطة واقعية',
-                style: TextStyle(fontSize: 15, color: Colors.white70),
+                'مشاهدة هادئة • مساعد صوتي ذكي • تجربة مجانية ٢٤ ساعة',
+                style: TextStyle(fontSize: 14, color: Colors.white70),
               ),
               const SizedBox(height: 30),
               const CircularProgressIndicator(color: Color(0xFF14B8A6)),
@@ -1096,21 +2031,21 @@ class _OnboardingScreenState extends State<OnboardingScreen> {
   final List<Map<String, String>> _steps = [
     {
       'emoji': '🌿📺',
-      'title': '١. المشاهدة الهادئة (Low-Stimulation)',
+      'title': '١. المشاهدة الهادئة + تجربة مجانية ليوم كامل',
       'subtitle':
-          'قصص مرئية مصممة خصيصاً للأطفال بإيقاع بصري وصوتي هادئ يحمي التركيز ويغذي الخيال واللغة العربية الفصحى بعيداً عن التشتت.',
+          'قصص مرئية مصممة خصيصاً للأطفال بإيقاع بصري وصوتي هادئ، مع تجربة مجانية شاملة لمدة ٢٤ ساعة فور التسجيل بحساب جوجل أو الإيميل.',
     },
     {
-      'emoji': '⏳🌙',
-      'title': '٢. الفطام الذكي عن الشاشة',
+      'emoji': '🎙️🤖',
+      'title': '٢. مصحح «ردد معي» الصوتي والمساعد الذكي',
       'subtitle':
-          'يحدد الوالدان دقائق المشاهدة اليومية لكل طفل، ومع اقتراب المساء يعمل فلتر الإضاءة الدافئة ثم تنسدل «ستارة النوم الهادئة» بلطف.',
+          'يستمع التطبيق لنطق طفلك بالعربية الفصحى ويتأكد من صحته ويعدّله بصوت هادئ ودافئ، مع مساعد ذكي يقدم تنبيهات واقتراحات مشاهدة.',
     },
     {
-      'emoji': '🎯🏆',
-      'title': '٣. الأنشطة الواقعية وتحدي الفصاحة',
+      'emoji': '📧💳',
+      'title': '٣. تنبيهات الإيميل للآباء ووسائل الدفع المصرية',
       'subtitle':
-          'كل قصة تنتهي بنافذة «ردد معي» لنطق جملة عربية فصيحة و«نشاط البطل الواقعي» لتنفيذ مهمة حركية وتربوية خارج الشاشة وكسب النجوم.',
+          'تقارير واقتراحات تربوية ذكية تصل لإيميل الوالدين، وباقات اشتراك مرنة تدعم فودافون كاش، أورنج كاش، اتصالات كاش، إنستا باي، وفيزا.',
     },
   ];
 
@@ -1141,7 +2076,7 @@ class _OnboardingScreenState extends State<OnboardingScreen> {
                   mainAxisAlignment: MainAxisAlignment.spaceBetween,
                   children: [
                     const Text(
-                      'حنين كيدز v2.0',
+                      'حنين كيدز v2.5',
                       style: TextStyle(
                         fontWeight: FontWeight.bold,
                         color: Color(0xFF14B8A6),
@@ -1150,7 +2085,7 @@ class _OnboardingScreenState extends State<OnboardingScreen> {
                     TextButton(
                       onPressed: widget.appState.completeOnboarding,
                       child: const Text(
-                        'تخطي إلى تسجيل الدخول',
+                        'تخطي إلى التسجيل',
                         style: TextStyle(color: Colors.white70, fontSize: 14),
                       ),
                     ),
@@ -1187,7 +2122,7 @@ class _OnboardingScreenState extends State<OnboardingScreen> {
                             item['title']!,
                             textAlign: TextAlign.center,
                             style: const TextStyle(
-                              fontSize: 23,
+                              fontSize: 22,
                               fontWeight: FontWeight.bold,
                               color: Colors.white,
                             ),
@@ -1197,7 +2132,7 @@ class _OnboardingScreenState extends State<OnboardingScreen> {
                             item['subtitle']!,
                             textAlign: TextAlign.center,
                             style: const TextStyle(
-                              fontSize: 16,
+                              fontSize: 15,
                               height: 1.6,
                               color: Colors.white70,
                             ),
@@ -1256,7 +2191,7 @@ class _OnboardingScreenState extends State<OnboardingScreen> {
                         child: Text(
                           _currentPage < _steps.length - 1
                               ? 'الخطوة التالية'
-                              : 'ابدأ الآن (إنشاء حساب أو دخول)',
+                              : 'ابدأ تجربتك المجانية (٢٤ ساعة)',
                           style: const TextStyle(
                             fontSize: 16,
                             fontWeight: FontWeight.bold,
@@ -1281,7 +2216,7 @@ class _OnboardingScreenState extends State<OnboardingScreen> {
                         label: const Text(
                           'دخول سريع بحساب تجريبي (parent@haneenkids.com / 123456)',
                           style: TextStyle(
-                            fontSize: 13,
+                            fontSize: 12,
                             fontWeight: FontWeight.bold,
                           ),
                         ),
@@ -1307,7 +2242,7 @@ class AuthScreen extends StatefulWidget {
 }
 
 class _AuthScreenState extends State<AuthScreen> {
-  bool _isLogin = true;
+  bool _isLogin = false;
   bool _obscurePassword = true;
   bool _isSubmitting = false;
   String? _errorMessage;
@@ -1328,7 +2263,16 @@ class _AuthScreenState extends State<AuthScreen> {
     '4–8 سنوات',
     '6–10 سنوات'
   ];
-  final List<String> _avatars = ['🦁', '🦋', '🐰', '🐼', '🚀', '🌸', '🐬', '🦊'];
+  final List<String> _avatars = [
+    '🦁',
+    '🦋',
+    '🐰',
+    '🐼',
+    '🚀',
+    '🌸',
+    '🐬',
+    '🦊'
+  ];
 
   @override
   void dispose() {
@@ -1371,6 +2315,218 @@ class _AuthScreenState extends State<AuthScreen> {
         _errorMessage = error;
       });
     }
+  }
+
+  void _openGoogleSignUpModal() {
+    final googleEmailCtrl =
+        TextEditingController(text: 'ahmed.family.eg@gmail.com');
+    final googleNameCtrl = TextEditingController(text: 'أحمد محمود (حساب جوجل)');
+    final googlePinCtrl = TextEditingController(text: _pinCtrl.text);
+    final googleChildCtrl = TextEditingController(
+        text: _childNameCtrl.text.isEmpty ? 'ياسين' : _childNameCtrl.text);
+    String googleAge = _selectedAgeGroup;
+    String googleAvatar = _selectedAvatar;
+    int googleMinutes = _initialDailyMinutes;
+    String? modalError;
+
+    showModalBottomSheet(
+      context: context,
+      isScrollControlled: true,
+      backgroundColor: const Color(0xFF1E293B),
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(26)),
+      ),
+      builder: (ctx) {
+        return StatefulBuilder(
+          builder: (ctx, setModalState) {
+            return Padding(
+              padding: EdgeInsets.only(
+                right: 24,
+                left: 24,
+                top: 24,
+                bottom: MediaQuery.of(ctx).viewInsets.bottom + 24,
+              ),
+              child: SingleChildScrollView(
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Row(
+                      children: [
+                        Container(
+                          padding: const EdgeInsets.all(10),
+                          decoration: const BoxDecoration(
+                            color: Colors.white,
+                            shape: BoxShape.circle,
+                          ),
+                          child: const Text(
+                            'G',
+                            style: TextStyle(
+                              fontSize: 22,
+                              fontWeight: FontWeight.w900,
+                              color: Color(0xFF4285F4),
+                            ),
+                          ),
+                        ),
+                        const SizedBox(width: 12),
+                        const Expanded(
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              Text(
+                                'التسجيل السريع بحساب Google',
+                                style: TextStyle(
+                                  fontSize: 19,
+                                  fontWeight: FontWeight.bold,
+                                  color: Colors.white,
+                                ),
+                              ),
+                              Text(
+                                'يشمل تجربة مجانية فورية لمدة ٢٤ ساعة + تنبيهات الإيميل',
+                                style: TextStyle(
+                                    fontSize: 12, color: Color(0xFF14B8A6)),
+                              ),
+                            ],
+                          ),
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 16),
+                    TextField(
+                      controller: googleEmailCtrl,
+                      keyboardType: TextInputType.emailAddress,
+                      decoration: const InputDecoration(
+                        labelText: 'حساب جوجل (Gmail)',
+                        prefixIcon: Icon(Icons.mail_outline),
+                      ),
+                    ),
+                    const SizedBox(height: 12),
+                    TextField(
+                      controller: googleNameCtrl,
+                      decoration: const InputDecoration(
+                        labelText: 'اسم ولي الأمر في حساب Google',
+                        prefixIcon: Icon(Icons.person_outline),
+                      ),
+                    ),
+                    const SizedBox(height: 12),
+                    Row(
+                      children: [
+                        Expanded(
+                          child: TextField(
+                            controller: googleChildCtrl,
+                            decoration: const InputDecoration(
+                              labelText: 'اسم الطفل الأول',
+                              prefixIcon: Icon(Icons.child_care),
+                            ),
+                          ),
+                        ),
+                        const SizedBox(width: 10),
+                        SizedBox(
+                          width: 115,
+                          child: TextField(
+                            controller: googlePinCtrl,
+                            keyboardType: TextInputType.number,
+                            maxLength: 4,
+                            decoration: const InputDecoration(
+                              labelText: 'PIN الأبوي',
+                              counterText: '',
+                              prefixIcon: Icon(Icons.lock_outline),
+                            ),
+                          ),
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 12),
+                    Row(
+                      children: [
+                        Expanded(
+                          child: DropdownButtonFormField<String>(
+                            value: googleAge,
+                            decoration: const InputDecoration(
+                              labelText: 'الفئة العمرية',
+                            ),
+                            items: _ageGroups
+                                .map((age) => DropdownMenuItem(
+                                      value: age,
+                                      child: Text(age),
+                                    ))
+                                .toList(),
+                            onChanged: (v) {
+                              if (v != null) {
+                                setModalState(() => googleAge = v);
+                              }
+                            },
+                          ),
+                        ),
+                        const SizedBox(width: 12),
+                        DropdownButton<String>(
+                          value: googleAvatar,
+                          items: _avatars
+                              .map((e) => DropdownMenuItem(
+                                    value: e,
+                                    child: Text(e,
+                                        style: const TextStyle(fontSize: 24)),
+                                  ))
+                              .toList(),
+                          onChanged: (v) {
+                            if (v != null) {
+                              setModalState(() => googleAvatar = v);
+                            }
+                          },
+                        ),
+                      ],
+                    ),
+                    if (modalError != null) ...[
+                      const SizedBox(height: 10),
+                      Text(modalError!,
+                          style: const TextStyle(color: Colors.redAccent)),
+                    ],
+                    const SizedBox(height: 18),
+                    SizedBox(
+                      width: double.infinity,
+                      height: 52,
+                      child: ElevatedButton.icon(
+                        style: ElevatedButton.styleFrom(
+                          backgroundColor: Colors.white,
+                          foregroundColor: Colors.black87,
+                          shape: RoundedRectangleBorder(
+                            borderRadius: BorderRadius.circular(14),
+                          ),
+                        ),
+                        onPressed: () async {
+                          final err =
+                              await widget.appState.signInOrSignUpWithGoogle(
+                            googleEmail: googleEmailCtrl.text,
+                            googleDisplayName: googleNameCtrl.text,
+                            parentalPin: googlePinCtrl.text,
+                            childName: googleChildCtrl.text,
+                            childAgeGroup: googleAge,
+                            childAvatar: googleAvatar,
+                            dailyTimeLimit: googleMinutes,
+                          );
+                          if (err != null) {
+                            setModalState(() => modalError = err);
+                          } else if (ctx.mounted) {
+                            Navigator.pop(ctx);
+                          }
+                        },
+                        icon: const Icon(Icons.verified_user,
+                            color: Color(0xFF4285F4)),
+                        label: const Text(
+                          'متابعة بحساب Google وبدء تجربة ٢٤ ساعة مجاناً',
+                          style: TextStyle(
+                              fontWeight: FontWeight.bold, fontSize: 14),
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            );
+          },
+        );
+      },
+    );
   }
 
   void _quickDemoLogin() {
@@ -1503,14 +2659,14 @@ class _AuthScreenState extends State<AuthScreen> {
         child: SafeArea(
           child: Center(
             child: SingleChildScrollView(
-              padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 20),
+              padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 18),
               child: ConstrainedBox(
                 constraints: const BoxConstraints(maxWidth: 460),
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.center,
                   children: [
                     Container(
-                      padding: const EdgeInsets.all(18),
+                      padding: const EdgeInsets.all(16),
                       decoration: BoxDecoration(
                         color: const Color(0xFF14B8A6).withOpacity(0.15),
                         shape: BoxShape.circle,
@@ -1519,27 +2675,80 @@ class _AuthScreenState extends State<AuthScreen> {
                         ),
                       ),
                       child:
-                          const Text('🌙✨', style: TextStyle(fontSize: 42)),
+                          const Text('🌙✨', style: TextStyle(fontSize: 38)),
                     ),
-                    const SizedBox(height: 12),
+                    const SizedBox(height: 10),
                     const Text(
-                      'حنين كيدز — بوابة الوالدين',
+                      'حنين كيدز — بوابة العائلة',
                       style: TextStyle(
-                        fontSize: 24,
+                        fontSize: 23,
                         fontWeight: FontWeight.bold,
                         color: Colors.white,
                       ),
                     ),
                     const SizedBox(height: 6),
-                    Text(
-                      _isLogin
-                          ? 'سجّل دخولك لمتابعة قصص أطفالك وإدارة وقت الشاشة'
-                          : 'أنشئ حساباً جديداً للوالدين واحفظ رمز الـ PIN الأبوي',
-                      textAlign: TextAlign.center,
-                      style:
-                          const TextStyle(color: Colors.white70, fontSize: 14),
+                    Container(
+                      padding: const EdgeInsets.symmetric(
+                          horizontal: 12, vertical: 5),
+                      decoration: BoxDecoration(
+                        color: const Color(0xFFF59E0B).withOpacity(0.18),
+                        borderRadius: BorderRadius.circular(20),
+                        border: Border.all(
+                            color: const Color(0xFFF59E0B).withOpacity(0.5)),
+                      ),
+                      child: const Text(
+                        '🎁 هدية الحساب الجديد: تجربة مجانية شاملة لمدة يوم كامل (٢٤ ساعة)',
+                        style: TextStyle(
+                          fontSize: 12,
+                          fontWeight: FontWeight.bold,
+                          color: Color(0xFFFDE68A),
+                        ),
+                      ),
                     ),
-                    const SizedBox(height: 22),
+                    const SizedBox(height: 16),
+
+                    SizedBox(
+                      width: double.infinity,
+                      height: 52,
+                      child: ElevatedButton.icon(
+                        style: ElevatedButton.styleFrom(
+                          backgroundColor: Colors.white,
+                          foregroundColor: Colors.black87,
+                          elevation: 3,
+                          shape: RoundedRectangleBorder(
+                            borderRadius: BorderRadius.circular(14),
+                          ),
+                        ),
+                        onPressed: _openGoogleSignUpModal,
+                        icon: Container(
+                          padding: const EdgeInsets.symmetric(
+                              horizontal: 7, vertical: 2),
+                          decoration: BoxDecoration(
+                            color: const Color(0xFF4285F4).withOpacity(0.12),
+                            borderRadius: BorderRadius.circular(8),
+                          ),
+                          child: const Text(
+                            'G',
+                            style: TextStyle(
+                              fontSize: 18,
+                              fontWeight: FontWeight.w900,
+                              color: Color(0xFF4285F4),
+                            ),
+                          ),
+                        ),
+                        label: Text(
+                          _isLogin
+                              ? 'الدخول السريع باستخدام حساب جوجل (Google)'
+                              : 'تسجيل حساب جديد باستخدام جوجل (Google)',
+                          style: const TextStyle(
+                            fontSize: 14,
+                            fontWeight: FontWeight.bold,
+                          ),
+                        ),
+                      ),
+                    ),
+                    const SizedBox(height: 14),
+
                     Container(
                       padding: const EdgeInsets.all(4),
                       decoration: BoxDecoration(
@@ -1551,20 +2760,20 @@ class _AuthScreenState extends State<AuthScreen> {
                           Expanded(
                             child: GestureDetector(
                               onTap: () => setState(() {
-                                _isLogin = true;
+                                _isLogin = false;
                                 _errorMessage = null;
                               }),
                               child: Container(
                                 padding:
-                                    const EdgeInsets.symmetric(vertical: 12),
+                                    const EdgeInsets.symmetric(vertical: 11),
                                 decoration: BoxDecoration(
-                                  color: _isLogin
+                                  color: !_isLogin
                                       ? const Color(0xFF14B8A6)
                                       : Colors.transparent,
                                   borderRadius: BorderRadius.circular(10),
                                 ),
                                 child: const Text(
-                                  'تسجيل الدخول (Sign In)',
+                                  'حساب جديد (تجربة يوم)',
                                   textAlign: TextAlign.center,
                                   style: TextStyle(fontWeight: FontWeight.bold),
                                 ),
@@ -1574,20 +2783,20 @@ class _AuthScreenState extends State<AuthScreen> {
                           Expanded(
                             child: GestureDetector(
                               onTap: () => setState(() {
-                                _isLogin = false;
+                                _isLogin = true;
                                 _errorMessage = null;
                               }),
                               child: Container(
                                 padding:
-                                    const EdgeInsets.symmetric(vertical: 12),
+                                    const EdgeInsets.symmetric(vertical: 11),
                                 decoration: BoxDecoration(
-                                  color: !_isLogin
+                                  color: _isLogin
                                       ? const Color(0xFF14B8A6)
                                       : Colors.transparent,
                                   borderRadius: BorderRadius.circular(10),
                                 ),
                                 child: const Text(
-                                  'حساب جديد (Sign Up)',
+                                  'تسجيل الدخول',
                                   textAlign: TextAlign.center,
                                   style: TextStyle(fontWeight: FontWeight.bold),
                                 ),
@@ -1597,7 +2806,8 @@ class _AuthScreenState extends State<AuthScreen> {
                         ],
                       ),
                     ),
-                    const SizedBox(height: 20),
+                    const SizedBox(height: 16),
+
                     if (!_isLogin) ...[
                       TextField(
                         controller: _fullNameCtrl,
@@ -1607,18 +2817,19 @@ class _AuthScreenState extends State<AuthScreen> {
                           prefixIcon: Icon(Icons.person_outline),
                         ),
                       ),
-                      const SizedBox(height: 14),
+                      const SizedBox(height: 12),
                     ],
                     TextField(
                       controller: _emailCtrl,
                       keyboardType: TextInputType.emailAddress,
                       decoration: const InputDecoration(
-                        labelText: 'البريد الإلكتروني أو رقم الهاتف',
+                        labelText:
+                            'البريد الإلكتروني (لإرسال التنبيهات والاقتراحات)',
                         hintText: 'parent@haneenkids.com',
                         prefixIcon: Icon(Icons.alternate_email),
                       ),
                     ),
-                    const SizedBox(height: 14),
+                    const SizedBox(height: 12),
                     TextField(
                       controller: _passwordCtrl,
                       obscureText: _obscurePassword,
@@ -1637,7 +2848,7 @@ class _AuthScreenState extends State<AuthScreen> {
                       ),
                     ),
                     if (!_isLogin) ...[
-                      const SizedBox(height: 14),
+                      const SizedBox(height: 12),
                       TextField(
                         controller: _pinCtrl,
                         keyboardType: TextInputType.number,
@@ -1648,7 +2859,7 @@ class _AuthScreenState extends State<AuthScreen> {
                           prefixIcon: Icon(Icons.shield_outlined),
                         ),
                       ),
-                      const SizedBox(height: 18),
+                      const SizedBox(height: 16),
                       Container(
                         padding: const EdgeInsets.all(16),
                         decoration: BoxDecoration(
@@ -1788,7 +2999,7 @@ class _AuthScreenState extends State<AuthScreen> {
                         ),
                       ),
                     ],
-                    const SizedBox(height: 20),
+                    const SizedBox(height: 18),
                     SizedBox(
                       width: double.infinity,
                       height: 54,
@@ -1813,38 +3024,36 @@ class _AuthScreenState extends State<AuthScreen> {
                             : Text(
                                 _isLogin
                                     ? 'دخول إلى التطبيق'
-                                    : 'إنشاء الحساب وحفظ PIN',
+                                    : 'إنشاء الحساب وتفعيل تجربة ٢٤ ساعة',
                                 style: const TextStyle(
-                                  fontSize: 17,
+                                  fontSize: 16,
                                   fontWeight: FontWeight.bold,
                                 ),
                               ),
                       ),
                     ),
-                    if (_isLogin) ...[
-                      const SizedBox(height: 12),
-                      Row(
-                        mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                        children: [
-                          TextButton(
-                            onPressed: _showForgotPasswordModal,
-                            child: const Text(
-                              'نسيت كلمة المرور؟',
-                              style: TextStyle(color: Colors.white70),
-                            ),
+                    const SizedBox(height: 10),
+                    Row(
+                      mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                      children: [
+                        TextButton(
+                          onPressed: _showForgotPasswordModal,
+                          child: const Text(
+                            'نسيت كلمة المرور؟',
+                            style: TextStyle(color: Colors.white70),
                           ),
-                          TextButton.icon(
-                            onPressed: _quickDemoLogin,
-                            icon: const Icon(Icons.flash_on,
-                                size: 18, color: Color(0xFFF59E0B)),
-                            label: const Text(
-                              'دخول سريع بحساب تجريبي',
-                              style: TextStyle(color: Color(0xFFF59E0B)),
-                            ),
+                        ),
+                        TextButton.icon(
+                          onPressed: _quickDemoLogin,
+                          icon: const Icon(Icons.flash_on,
+                              size: 18, color: Color(0xFFF59E0B)),
+                          label: const Text(
+                            'دخول سريع بحساب تجريبي',
+                            style: TextStyle(color: Color(0xFFF59E0B)),
                           ),
-                        ],
-                      ),
-                    ],
+                        ),
+                      ],
+                    ),
                   ],
                 ),
               ),
@@ -1855,7 +3064,6 @@ class _AuthScreenState extends State<AuthScreen> {
     );
   }
 }
-
 
 class MultiChildProfilesScreen extends StatefulWidget {
   final AppStateManager appState;
@@ -2089,11 +3297,34 @@ class _MultiChildProfilesScreenState extends State<MultiChildProfilesScreen> {
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
+                Container(
+                  padding: const EdgeInsets.all(12),
+                  decoration: BoxDecoration(
+                    color: const Color(0xFF1E293B),
+                    borderRadius: BorderRadius.circular(14),
+                    border: Border.all(color: Colors.white12),
+                  ),
+                  child: Row(
+                    children: [
+                      const Icon(Icons.verified_outlined,
+                          color: Color(0xFFF59E0B)),
+                      const SizedBox(width: 10),
+                      Expanded(
+                        child: Text(
+                          'حالة الاشتراك: ${account.subscriptionStatusLabel}',
+                          style: const TextStyle(
+                              fontSize: 12, color: Colors.white),
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+                const SizedBox(height: 14),
                 Text(
                   'مرحباً بك يا ${account.fullName} 👋 اختر ملف الطفل للبدء أو أضف طفلاً جديداً:',
                   style: const TextStyle(color: Colors.white70, fontSize: 14),
                 ),
-                const SizedBox(height: 18),
+                const SizedBox(height: 16),
                 Expanded(
                   child: GridView.builder(
                     gridDelegate:
@@ -2101,7 +3332,7 @@ class _MultiChildProfilesScreenState extends State<MultiChildProfilesScreen> {
                       crossAxisCount: 2,
                       mainAxisSpacing: 14,
                       crossAxisSpacing: 14,
-                      childAspectRatio: 0.88,
+                      childAspectRatio: 0.86,
                     ),
                     itemCount: account.children.length + 1,
                     itemBuilder: (context, index) {
@@ -2221,7 +3452,6 @@ class _MultiChildProfilesScreenState extends State<MultiChildProfilesScreen> {
   }
 }
 
-
 class VerticalVideoFeedPlayerScreen extends StatefulWidget {
   final AppStateManager appState;
   const VerticalVideoFeedPlayerScreen({super.key, required this.appState});
@@ -2250,131 +3480,215 @@ class _VerticalVideoFeedPlayerScreenState
     widget.appState.recordVideoTransitionWatched();
   }
 
-  void _openRepeatWithMeModal(VideoModel item) {
-    bool isRecording = false;
-    bool hasRecorded = false;
+  void _jumpToSuggestedVideo(VideoModel target) {
+    setState(() {
+      _selectedCategory = 'all';
+    });
+    final int idx =
+        widget.appState.videos.indexWhere((v) => v.id == target.id);
+    if (idx != -1 && _pageController.hasClients) {
+      _pageController.jumpToPage(idx);
+      setState(() {
+        _currentVideoIndex = idx;
+      });
+    }
+  }
+
+  void _openSmartVoiceAssistantModal() {
+    final child = widget.appState.currentAccount?.activeChild;
+    final String childName = child?.name ?? 'بطل حنين';
+    widget.appState.triggerVoiceAssistantGreetingAndSuggestion();
 
     showModalBottomSheet(
       context: context,
+      isScrollControlled: true,
       backgroundColor: const Color(0xFF1E293B),
       shape: const RoundedRectangleBorder(
-        borderRadius: BorderRadius.vertical(top: Radius.circular(26)),
+        borderRadius: BorderRadius.vertical(top: Radius.circular(28)),
       ),
       builder: (ctx) {
         return StatefulBuilder(
           builder: (ctx, setModalState) {
+            final suggested = widget.appState.suggestedVideoForChild ??
+                widget.appState.videos.first;
             return Padding(
               padding: const EdgeInsets.all(24),
               child: Column(
                 mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
-                  GestureDetector(
-                    onTap: () async {
-                      if (isRecording) return;
-                      setModalState(() {
-                        isRecording = true;
-                      });
-                      await Future.delayed(const Duration(seconds: 2));
-                      if (ctx.mounted) {
-                        setModalState(() {
-                          isRecording = false;
-                          hasRecorded = true;
-                        });
-                      }
-                    },
-                    child: AnimatedContainer(
-                      duration: const Duration(milliseconds: 250),
-                      padding: const EdgeInsets.all(20),
-                      decoration: BoxDecoration(
-                        color: isRecording
-                            ? Colors.redAccent.withOpacity(0.25)
-                            : const Color(0xFFF59E0B).withOpacity(0.2),
-                        shape: BoxShape.circle,
-                        border: Border.all(
-                          color: isRecording
-                              ? Colors.redAccent
-                              : const Color(0xFFF59E0B),
-                          width: 2.5,
+                  Row(
+                    children: [
+                      Container(
+                        padding: const EdgeInsets.all(12),
+                        decoration: BoxDecoration(
+                          color: const Color(0xFF14B8A6).withOpacity(0.2),
+                          shape: BoxShape.circle,
+                          border: Border.all(
+                              color: const Color(0xFF14B8A6), width: 2),
+                        ),
+                        child: const Text('🤖🎙️',
+                            style: TextStyle(fontSize: 30)),
+                      ),
+                      const SizedBox(width: 12),
+                      Expanded(
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Text(
+                              'رفيق حنين الصوتي الذكي ($childName)',
+                              style: const TextStyle(
+                                fontSize: 18,
+                                fontWeight: FontWeight.bold,
+                                color: Colors.white,
+                              ),
+                            ),
+                            const Text(
+                              'يتحدث بصوت هادئ ويقترح عليك أجمل القصص والأنشطة',
+                              style: TextStyle(
+                                  fontSize: 12, color: Colors.white70),
+                            ),
+                          ],
                         ),
                       ),
-                      child: Icon(
-                        isRecording ? Icons.mic : Icons.mic_none_rounded,
-                        size: 46,
-                        color: isRecording
-                            ? Colors.redAccent
-                            : const Color(0xFFF59E0B),
+                      IconButton(
+                        onPressed: () => CalmVoiceService.instance.speakCalmly(
+                          widget.appState.currentAssistantBannerMessage,
+                        ),
+                        icon: const Icon(Icons.volume_up_rounded,
+                            color: Color(0xFFF59E0B), size: 28),
                       ),
-                    ),
+                    ],
                   ),
-                  const SizedBox(height: 12),
-                  Text(
-                    isRecording
-                        ? '🎙️ جاري الاستماع لصوتك الجميل...'
-                        : 'نافذة «ردد معي» للفصاحة والنطق',
-                    style: const TextStyle(
-                      fontSize: 20,
-                      fontWeight: FontWeight.bold,
-                      color: Color(0xFFF59E0B),
-                    ),
-                  ),
-                  const SizedBox(height: 8),
-                  const Text(
-                    'اضغط على زر الميكروفون وردد هذه الجملة العربية الفصيحة بصوت واضح:',
-                    textAlign: TextAlign.center,
-                    style: TextStyle(color: Colors.white70, fontSize: 13),
-                  ),
-                  const SizedBox(height: 14),
+                  const SizedBox(height: 16),
                   Container(
                     width: double.infinity,
-                    padding: const EdgeInsets.all(18),
+                    padding: const EdgeInsets.all(16),
                     decoration: BoxDecoration(
                       color: const Color(0xFF0F172A),
                       borderRadius: BorderRadius.circular(16),
                       border: Border.all(color: const Color(0xFF14B8A6)),
                     ),
                     child: Text(
-                      item.repeatPhrase,
-                      textAlign: TextAlign.center,
+                      widget.appState.currentAssistantBannerMessage,
                       style: const TextStyle(
-                        fontSize: 20,
-                        fontWeight: FontWeight.bold,
+                        fontSize: 15,
+                        height: 1.5,
                         color: Colors.white,
                       ),
                     ),
                   ),
-                  const SizedBox(height: 18),
-                  SizedBox(
-                    width: double.infinity,
-                    height: 50,
-                    child: ElevatedButton.icon(
-                      style: ElevatedButton.styleFrom(
-                        backgroundColor: const Color(0xFF14B8A6),
-                        foregroundColor: Colors.white,
-                        shape: RoundedRectangleBorder(
-                          borderRadius: BorderRadius.circular(14),
-                        ),
+                  const SizedBox(height: 16),
+                  const Text(
+                    '✨ القصة المقترحة لك الآن:',
+                    style: TextStyle(
+                      fontSize: 14,
+                      fontWeight: FontWeight.bold,
+                      color: Color(0xFFF59E0B),
+                    ),
+                  ),
+                  const SizedBox(height: 8),
+                  Card(
+                    color: const Color(0xFF0F172A),
+                    shape: RoundedRectangleBorder(
+                      borderRadius: BorderRadius.circular(16),
+                      side: const BorderSide(color: Colors.white24),
+                    ),
+                    child: ListTile(
+                      leading: Text(suggested.emoji,
+                          style: const TextStyle(fontSize: 34)),
+                      title: Text(
+                        suggested.title,
+                        style: const TextStyle(fontWeight: FontWeight.bold),
                       ),
-                      onPressed: () {
-                        widget.appState
-                            .awardStarAndRecordActivity('phrase_${item.id}');
-                        Navigator.pop(ctx);
-                        ScaffoldMessenger.of(context).showSnackBar(
-                          const SnackBar(
-                            content: Text(
-                                '🎉 أحسنت المحاكاة والنطق يا بطل! ربحت نجمة الفصاحة ⭐'),
-                            backgroundColor: Color(0xFF14B8A6),
-                          ),
-                        );
-                      },
-                      icon: Icon(hasRecorded ? Icons.verified : Icons.star),
-                      label: Text(
-                        hasRecorded
-                            ? 'تمت المحاكاة بنجاح! استلم نجمتك ⭐'
-                            : 'رددتها بصوت فصيح! (احصل على نجمة ⭐)',
+                      subtitle: Text(
+                        '${VideoModel.getCategoryDisplayLabel(suggested.category)} • ${suggested.ageGroup}',
                         style: const TextStyle(
-                            fontWeight: FontWeight.bold, fontSize: 15),
+                            color: Colors.white70, fontSize: 12),
+                      ),
+                      trailing: ElevatedButton(
+                        style: ElevatedButton.styleFrom(
+                          backgroundColor: const Color(0xFF14B8A6),
+                          foregroundColor: Colors.white,
+                        ),
+                        onPressed: () {
+                          Navigator.pop(ctx);
+                          _jumpToSuggestedVideo(suggested);
+                        },
+                        child: const Text('شاهد الآن'),
                       ),
                     ),
+                  ),
+                  const SizedBox(height: 14),
+                  const Text(
+                    '🎧 اطلب من المساعد الصوتي أن يساعدك:',
+                    style: TextStyle(fontSize: 13, color: Colors.white70),
+                  ),
+                  const SizedBox(height: 10),
+                  Wrap(
+                    spacing: 8,
+                    runSpacing: 8,
+                    children: [
+                      ActionChip(
+                        backgroundColor: const Color(0xFF0F172A),
+                        avatar: const Text('🌙'),
+                        label: const Text('اقترح قصة نوم هادئة'),
+                        onPressed: () {
+                          final bedtimeVideo =
+                              widget.appState.videos.firstWhere(
+                            (v) => v.category == 'bedtime',
+                            orElse: () => widget.appState.videos.first,
+                          );
+                          setModalState(() {
+                            widget.appState.suggestedVideoForChild =
+                                bedtimeVideo;
+                            widget.appState.currentAssistantBannerMessage =
+                                'اخترت لك قصة النوم الهادئة «${bedtimeVideo.title}». تنفس بعمق واستمع بهدوء يا $childName.';
+                          });
+                          CalmVoiceService.instance.speakCalmly(
+                            widget.appState.currentAssistantBannerMessage,
+                          );
+                        },
+                      ),
+                      ActionChip(
+                        backgroundColor: const Color(0xFF0F172A),
+                        avatar: const Text('🗣️'),
+                        label: const Text('دربني على جملة عربية فصيحة'),
+                        onPressed: () {
+                          final arabicVideo = widget.appState.videos.firstWhere(
+                            (v) => v.category == 'arabic',
+                            orElse: () => widget.appState.videos.first,
+                          );
+                          setModalState(() {
+                            widget.appState.suggestedVideoForChild =
+                                arabicVideo;
+                            widget.appState.currentAssistantBannerMessage =
+                                'هيا نردد معاً بهدوء: ${arabicVideo.repeatPhrase}';
+                          });
+                          CalmVoiceService.instance.speakCalmly(
+                            'هيا نردد معاً بهدوء يا $childName: ${arabicVideo.repeatPhrase}',
+                            rate: 0.34,
+                          );
+                        },
+                      ),
+                      ActionChip(
+                        backgroundColor: const Color(0xFF0F172A),
+                        avatar: const Text('🧘'),
+                        label: const Text('تمرين التنفس والهدوء'),
+                        onPressed: () {
+                          const calmBreathing =
+                              'يا بطل حنين، خذ شهيقاً عميقاً وهادئاً من أنفك كأنك تشم وردة جميلة... والآن أخرج الهواء ببطء وابتسم!';
+                          setModalState(() {
+                            widget.appState.currentAssistantBannerMessage =
+                                calmBreathing;
+                          });
+                          CalmVoiceService.instance.speakCalmly(
+                            calmBreathing,
+                            rate: 0.34,
+                          );
+                        },
+                      ),
+                    ],
                   ),
                 ],
               ),
@@ -2385,7 +3699,356 @@ class _VerticalVideoFeedPlayerScreenState
     );
   }
 
+  void _openRepeatWithMeModal(VideoModel item) {
+    bool isListeningMic = false;
+    final TextEditingController spokenCtrl = TextEditingController();
+    PronunciationEvaluation? evaluation;
+
+    CalmVoiceService.instance.speakCalmly(
+      'استمع جيداً يا بطل ثم ردد معي بهدوء: ${item.repeatPhrase}',
+      rate: 0.35,
+    );
+
+    showModalBottomSheet(
+      context: context,
+      isScrollControlled: true,
+      backgroundColor: const Color(0xFF1E293B),
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(26)),
+      ),
+      builder: (ctx) {
+        return StatefulBuilder(
+          builder: (ctx, setModalState) {
+            Future<void> verifyAndSpeakCorrection() async {
+              final result = CalmVoiceService.evaluatePronunciation(
+                targetPhrase: item.repeatPhrase,
+                spokenText: spokenCtrl.text,
+              );
+              setModalState(() {
+                evaluation = result;
+              });
+
+              if (result.isCorrect) {
+                await CalmVoiceService.instance.speakCalmly(
+                  '${result.correctionAdvice} هيا نرددها معاً مرة أخرى بصوت هادئ: ${item.repeatPhrase}',
+                  rate: 0.36,
+                );
+              } else {
+                await CalmVoiceService.instance.speakCalmly(
+                  '${result.correctionAdvice} استمع لي وردد معي كلمة بكلمة: ${item.repeatPhrase}',
+                  rate: 0.32,
+                );
+              }
+            }
+
+            return Padding(
+              padding: EdgeInsets.only(
+                right: 24,
+                left: 24,
+                top: 24,
+                bottom: MediaQuery.of(ctx).viewInsets.bottom + 24,
+              ),
+              child: SingleChildScrollView(
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Row(
+                      mainAxisAlignment: MainAxisAlignment.center,
+                      children: [
+                        ElevatedButton.icon(
+                          style: ElevatedButton.styleFrom(
+                            backgroundColor: const Color(0xFF14B8A6),
+                            foregroundColor: Colors.white,
+                            shape: RoundedRectangleBorder(
+                              borderRadius: BorderRadius.circular(20),
+                            ),
+                          ),
+                          onPressed: () {
+                            CalmVoiceService.instance.speakCalmly(
+                              item.repeatPhrase,
+                              rate: 0.33,
+                            );
+                          },
+                          icon: const Icon(Icons.hearing_rounded),
+                          label: const Text('استمع للنطق الهادئ 🔊'),
+                        ),
+                        const SizedBox(width: 10),
+                        OutlinedButton.icon(
+                          style: OutlinedButton.styleFrom(
+                            foregroundColor: const Color(0xFFF59E0B),
+                            side: const BorderSide(color: Color(0xFFF59E0B)),
+                            shape: RoundedRectangleBorder(
+                              borderRadius: BorderRadius.circular(20),
+                            ),
+                          ),
+                          onPressed: () {
+                            CalmVoiceService.instance.speakCalmly(
+                              'هيا نقرأ معاً ببطء وهدوء: ${item.repeatPhrase}',
+                              rate: 0.30,
+                            );
+                          },
+                          icon: const Icon(Icons.record_voice_over_rounded),
+                          label: const Text('ردد معي بالصوت الهادئ'),
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 16),
+                    Container(
+                      width: double.infinity,
+                      padding: const EdgeInsets.all(16),
+                      decoration: BoxDecoration(
+                        color: const Color(0xFF0F172A),
+                        borderRadius: BorderRadius.circular(16),
+                        border: Border.all(color: const Color(0xFF14B8A6)),
+                      ),
+                      child: Text(
+                        item.repeatPhrase,
+                        textAlign: TextAlign.center,
+                        style: const TextStyle(
+                          fontSize: 20,
+                          fontWeight: FontWeight.bold,
+                          color: Colors.white,
+                        ),
+                      ),
+                    ),
+                    const SizedBox(height: 16),
+                    GestureDetector(
+                      onTap: () async {
+                        if (isListeningMic) {
+                          await CalmVoiceService.instance.stopListening();
+                          setModalState(() => isListeningMic = false);
+                          await verifyAndSpeakCorrection();
+                          return;
+                        }
+                        setModalState(() {
+                          isListeningMic = true;
+                        });
+                        final bool sttReady = await CalmVoiceService.instance
+                            .initSpeechRecognition();
+                        if (sttReady) {
+                          await CalmVoiceService.instance.startListening(
+                            onResult: (words) {
+                              if (ctx.mounted) {
+                                setModalState(() {
+                                  spokenCtrl.text = words;
+                                });
+                              }
+                            },
+                          );
+                          await Future.delayed(const Duration(seconds: 4));
+                          await CalmVoiceService.instance.stopListening();
+                          if (ctx.mounted) {
+                            setModalState(() => isListeningMic = false);
+                            if (spokenCtrl.text.trim().isNotEmpty) {
+                              await verifyAndSpeakCorrection();
+                            }
+                          }
+                        } else {
+                          await Future.delayed(const Duration(seconds: 2));
+                          if (ctx.mounted) {
+                            setModalState(() {
+                              isListeningMic = false;
+                              if (spokenCtrl.text.trim().isEmpty) {
+                                spokenCtrl.text = item.repeatPhrase;
+                              }
+                            });
+                            await verifyAndSpeakCorrection();
+                          }
+                        }
+                      },
+                      child: AnimatedContainer(
+                        duration: const Duration(milliseconds: 250),
+                        padding: const EdgeInsets.all(20),
+                        decoration: BoxDecoration(
+                          color: isListeningMic
+                              ? Colors.redAccent.withOpacity(0.25)
+                              : const Color(0xFFF59E0B).withOpacity(0.2),
+                          shape: BoxShape.circle,
+                          border: Border.all(
+                            color: isListeningMic
+                                ? Colors.redAccent
+                                : const Color(0xFFF59E0B),
+                            width: 2.5,
+                          ),
+                        ),
+                        child: Icon(
+                          isListeningMic ? Icons.mic : Icons.mic_none_rounded,
+                          size: 44,
+                          color: isListeningMic
+                              ? Colors.redAccent
+                              : const Color(0xFFF59E0B),
+                        ),
+                      ),
+                    ),
+                    const SizedBox(height: 8),
+                    Text(
+                      isListeningMic
+                          ? '🎙️ تحدث الآن بصوت واضح... أنا أستمع لنطقك'
+                          : 'اضغط على الميكروفون للتحدث أو راجع ما سمعه التطبيق أدناه:',
+                      textAlign: TextAlign.center,
+                      style:
+                          const TextStyle(fontSize: 13, color: Colors.white70),
+                    ),
+                    const SizedBox(height: 12),
+                    Row(
+                      children: [
+                        Expanded(
+                          child: TextField(
+                            controller: spokenCtrl,
+                            decoration: InputDecoration(
+                              labelText: 'ما نطقه الطفل (التعرف الصوتي)',
+                              hintText: 'انطق بالميكروفون أو اكتب لتجربة المصحح',
+                              suffixIcon: IconButton(
+                                icon: const Icon(Icons.check_circle_outline,
+                                    color: Color(0xFF14B8A6)),
+                                onPressed: verifyAndSpeakCorrection,
+                              ),
+                            ),
+                          ),
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 8),
+                    Wrap(
+                      spacing: 8,
+                      children: [
+                        TextButton.icon(
+                          onPressed: () {
+                            setModalState(() {
+                              spokenCtrl.text = item.repeatPhrase;
+                            });
+                            verifyAndSpeakCorrection();
+                          },
+                          icon: const Icon(Icons.done_all, size: 16),
+                          label: const Text('محاكاة نطق متقن ١٠٠٪',
+                              style: TextStyle(fontSize: 12)),
+                        ),
+                        TextButton.icon(
+                          onPressed: () {
+                            final words = CalmVoiceService.normalizeArabicText(
+                                    item.repeatPhrase)
+                                .split(' ');
+                            setModalState(() {
+                              spokenCtrl.text =
+                                  words.isNotEmpty ? words.first : '';
+                            });
+                            verifyAndSpeakCorrection();
+                          },
+                          icon: const Icon(Icons.build_circle_outlined,
+                              size: 16),
+                          label: const Text('محاكاة نطق ناقص للتصحيح',
+                              style: TextStyle(fontSize: 12)),
+                        ),
+                      ],
+                    ),
+                    if (evaluation != null) ...[
+                      const SizedBox(height: 12),
+                      Container(
+                        width: double.infinity,
+                        padding: const EdgeInsets.all(14),
+                        decoration: BoxDecoration(
+                          color: evaluation!.isCorrect
+                              ? const Color(0xFF14B8A6).withOpacity(0.18)
+                              : const Color(0xFFF59E0B).withOpacity(0.18),
+                          borderRadius: BorderRadius.circular(14),
+                          border: Border.all(
+                            color: evaluation!.isCorrect
+                                ? const Color(0xFF14B8A6)
+                                : const Color(0xFFF59E0B),
+                          ),
+                        ),
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Row(
+                              mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                              children: [
+                                Text(
+                                  evaluation!.isCorrect
+                                      ? '✅ نطق صحيح ومتقن!'
+                                      : '🔄 يحتاج لتعديل بسيط وهادئ',
+                                  style: const TextStyle(
+                                    fontWeight: FontWeight.bold,
+                                    fontSize: 15,
+                                  ),
+                                ),
+                                Text(
+                                  'الدقة: ${(evaluation!.accuracyScore * 100).round()}%',
+                                  style: const TextStyle(
+                                    fontWeight: FontWeight.bold,
+                                    color: Color(0xFFF59E0B),
+                                  ),
+                                ),
+                              ],
+                            ),
+                            const SizedBox(height: 6),
+                            Text(
+                              evaluation!.correctionAdvice,
+                              style: const TextStyle(
+                                  fontSize: 13, color: Colors.white),
+                            ),
+                          ],
+                        ),
+                      ),
+                    ],
+                    const SizedBox(height: 16),
+                    SizedBox(
+                      width: double.infinity,
+                      height: 50,
+                      child: ElevatedButton.icon(
+                        style: ElevatedButton.styleFrom(
+                          backgroundColor: (evaluation?.isCorrect ?? false)
+                              ? const Color(0xFF14B8A6)
+                              : const Color(0xFF334155),
+                          foregroundColor: Colors.white,
+                          shape: RoundedRectangleBorder(
+                            borderRadius: BorderRadius.circular(14),
+                          ),
+                        ),
+                        onPressed: (evaluation?.isCorrect ?? false)
+                            ? () {
+                                widget.appState.awardStarAndRecordActivity(
+                                  'phrase_${item.id}',
+                                  isPronunciation: true,
+                                );
+                                Navigator.pop(ctx);
+                                ScaffoldMessenger.of(context).showSnackBar(
+                                  const SnackBar(
+                                    content: Text(
+                                        '🎉 أحسنت النطق العربي الصحيح يا بطل! ربحت نجمة الفصاحة ⭐'),
+                                    backgroundColor: Color(0xFF14B8A6),
+                                  ),
+                                );
+                              }
+                            : verifyAndSpeakCorrection,
+                        icon: Icon((evaluation?.isCorrect ?? false)
+                            ? Icons.star
+                            : Icons.graphic_eq),
+                        label: Text(
+                          (evaluation?.isCorrect ?? false)
+                              ? 'تم التأكد من صحة النطق! استلم نجمتك ⭐'
+                              : 'تحقق من صحة النطق واستمع للتصحيح الهادئ',
+                          style: const TextStyle(
+                              fontWeight: FontWeight.bold, fontSize: 14),
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            );
+          },
+        );
+      },
+    );
+  }
+
   void _openRealWorldHeroActivityModal(VideoModel item) {
+    CalmVoiceService.instance.speakCalmly(
+      'نشاط البطل الواقعي: ${item.activeActivity}',
+      rate: 0.38,
+    );
+
     showModalBottomSheet(
       context: context,
       backgroundColor: const Color(0xFF1E293B),
@@ -2471,7 +4134,7 @@ class _VerticalVideoFeedPlayerScreenState
     );
   }
 
-  void _openParentalGateDialog() {
+  void _openParentalGateDialog({int initialTab = 0}) {
     final random = Random();
     final int a = random.nextInt(6) + 4;
     final int b = random.nextInt(5) + 3;
@@ -2507,7 +4170,7 @@ class _VerticalVideoFeedPlayerScreenState
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
                   const Text(
-                    'للدخول إلى استوديو الفيديوهات وضوابط الوقت، حل المعادلة الحسابية أو أدخل الرمز السري (PIN):',
+                    'للدخول إلى استوديو الفيديوهات والاشتراكات والتنبيهات، حل المعادلة أو أدخل الرمز السري (PIN):',
                     style: TextStyle(color: Colors.white70, fontSize: 13),
                   ),
                   const SizedBox(height: 16),
@@ -2570,6 +4233,7 @@ class _VerticalVideoFeedPlayerScreenState
                         MaterialPageRoute(
                           builder: (_) => ParentalStudioScreen(
                             appState: widget.appState,
+                            initialTabIndex: initialTab,
                           ),
                         ),
                       );
@@ -2601,6 +4265,7 @@ class _VerticalVideoFeedPlayerScreenState
     final activeChild = account.activeChild;
     final videos = _filteredVideos;
     final bool sleepCurtainActive = widget.appState.isDailyLimitReached;
+    final bool subscriptionExpired = widget.appState.isSubscriptionExpired;
 
     return Scaffold(
       body: Stack(
@@ -2632,8 +4297,9 @@ class _VerticalVideoFeedPlayerScreenState
               onPageChanged: _onPageChanged,
               itemBuilder: (context, index) {
                 final item = videos[index];
-                final isCurrentPage =
-                    index == _currentVideoIndex && !sleepCurtainActive;
+                final isCurrentPage = index == _currentVideoIndex &&
+                    !sleepCurtainActive &&
+                    !subscriptionExpired;
                 return VerticalVideoFeedItemWidget(
                   key: ValueKey('${item.id}_$index'),
                   video: item,
@@ -2642,6 +4308,7 @@ class _VerticalVideoFeedPlayerScreenState
                   onRepeatPhraseTap: () => _openRepeatWithMeModal(item),
                   onHeroActivityTap: () =>
                       _openRealWorldHeroActivityModal(item),
+                  onVoiceAssistantTap: _openSmartVoiceAssistantModal,
                 );
               },
             ),
@@ -2659,7 +4326,7 @@ class _VerticalVideoFeedPlayerScreenState
               children: [
                 Padding(
                   padding:
-                      const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+                      const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
                   child: Row(
                     children: [
                       GestureDetector(
@@ -2729,6 +4396,22 @@ class _VerticalVideoFeedPlayerScreenState
                       ),
                       const Spacer(),
                       GestureDetector(
+                        onTap: _openSmartVoiceAssistantModal,
+                        child: Container(
+                          padding: const EdgeInsets.all(7),
+                          decoration: BoxDecoration(
+                            color: const Color(0xFF38BDF8).withOpacity(0.85),
+                            shape: BoxShape.circle,
+                          ),
+                          child: const Icon(
+                            Icons.assistant_rounded,
+                            size: 18,
+                            color: Colors.black87,
+                          ),
+                        ),
+                      ),
+                      const SizedBox(width: 6),
+                      GestureDetector(
                         onTap: () => widget.appState.toggleWarmEveningFilter(),
                         child: Container(
                           padding: const EdgeInsets.all(7),
@@ -2750,7 +4433,7 @@ class _VerticalVideoFeedPlayerScreenState
                       ),
                       const SizedBox(width: 6),
                       GestureDetector(
-                        onTap: _openParentalGateDialog,
+                        onTap: () => _openParentalGateDialog(initialTab: 0),
                         child: Container(
                           padding: const EdgeInsets.symmetric(
                               horizontal: 10, vertical: 6),
@@ -2779,8 +4462,9 @@ class _VerticalVideoFeedPlayerScreenState
                     ],
                   ),
                 ),
+
                 SizedBox(
-                  height: 40,
+                  height: 38,
                   child: ListView.builder(
                     scrollDirection: Axis.horizontal,
                     padding: const EdgeInsets.symmetric(horizontal: 12),
@@ -2801,7 +4485,7 @@ class _VerticalVideoFeedPlayerScreenState
                         child: Container(
                           margin: const EdgeInsets.symmetric(horizontal: 4),
                           padding: const EdgeInsets.symmetric(
-                              horizontal: 14, vertical: 6),
+                              horizontal: 14, vertical: 5),
                           decoration: BoxDecoration(
                             color: isSelected
                                 ? const Color(0xFF14B8A6)
@@ -2828,6 +4512,51 @@ class _VerticalVideoFeedPlayerScreenState
                         ),
                       );
                     },
+                  ),
+                ),
+
+                Padding(
+                  padding:
+                      const EdgeInsets.symmetric(horizontal: 14, vertical: 6),
+                  child: GestureDetector(
+                    onTap: _openSmartVoiceAssistantModal,
+                    child: Container(
+                      padding: const EdgeInsets.symmetric(
+                          horizontal: 12, vertical: 8),
+                      decoration: BoxDecoration(
+                        color: const Color(0xFF1E293B).withOpacity(0.88),
+                        borderRadius: BorderRadius.circular(16),
+                        border: Border.all(
+                            color: const Color(0xFF38BDF8).withOpacity(0.6)),
+                      ),
+                      child: Row(
+                        children: [
+                          const Text('🤖🔊', style: TextStyle(fontSize: 18)),
+                          const SizedBox(width: 8),
+                          Expanded(
+                            child: Text(
+                              widget.appState.currentAssistantBannerMessage,
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
+                              style: const TextStyle(
+                                fontSize: 12,
+                                color: Colors.white,
+                                fontWeight: FontWeight.w600,
+                              ),
+                            ),
+                          ),
+                          const SizedBox(width: 6),
+                          const Text(
+                            'اقتراح ذكي',
+                            style: TextStyle(
+                              fontSize: 11,
+                              color: Color(0xFF38BDF8),
+                              fontWeight: FontWeight.bold,
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
                   ),
                 ),
               ],
@@ -2883,10 +4612,72 @@ class _VerticalVideoFeedPlayerScreenState
                             borderRadius: BorderRadius.circular(16),
                           ),
                         ),
-                        onPressed: _openParentalGateDialog,
+                        onPressed: () => _openParentalGateDialog(initialTab: 2),
                         icon: const Icon(Icons.lock_open),
                         label: const Text(
                           'بوابة الوالدين (لتمديد الوقت أو تغيير الطفل)',
+                          style: TextStyle(fontWeight: FontWeight.bold),
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+            ),
+
+          if (subscriptionExpired && !sleepCurtainActive)
+            Container(
+              width: double.infinity,
+              height: double.infinity,
+              decoration: const BoxDecoration(
+                gradient: LinearGradient(
+                  colors: [Color(0xFF0F172A), Color(0xFF1E1B4B)],
+                  begin: Alignment.topCenter,
+                  end: Alignment.bottomCenter,
+                ),
+              ),
+              child: SafeArea(
+                child: Padding(
+                  padding: const EdgeInsets.all(28),
+                  child: Column(
+                    mainAxisAlignment: MainAxisAlignment.center,
+                    children: [
+                      const Text('🎁👑', style: TextStyle(fontSize: 64)),
+                      const SizedBox(height: 16),
+                      const Text(
+                        'انتهت فترة التجربة المجانية (٢٤ ساعة)',
+                        textAlign: TextAlign.center,
+                        style: TextStyle(
+                          fontSize: 23,
+                          fontWeight: FontWeight.bold,
+                          color: Colors.white,
+                        ),
+                      ),
+                      const SizedBox(height: 12),
+                      const Text(
+                        'استمتع طفلك بقصص حنين الهادئة والمصحح الصوتي! يمكنك الآن اختيار الباقة المرنة الأنسب لعائلتك والدفع بسهولة عبر فودافون كاش أو أورنج كاش أو اتصالات كاش أو إنستا باي أو فيزا.',
+                        textAlign: TextAlign.center,
+                        style: TextStyle(
+                          fontSize: 15,
+                          height: 1.6,
+                          color: Colors.white70,
+                        ),
+                      ),
+                      const SizedBox(height: 28),
+                      ElevatedButton.icon(
+                        style: ElevatedButton.styleFrom(
+                          backgroundColor: const Color(0xFFF59E0B),
+                          foregroundColor: Colors.black87,
+                          padding: const EdgeInsets.symmetric(
+                              horizontal: 24, vertical: 14),
+                          shape: RoundedRectangleBorder(
+                            borderRadius: BorderRadius.circular(16),
+                          ),
+                        ),
+                        onPressed: () => _openParentalGateDialog(initialTab: 1),
+                        icon: const Icon(Icons.workspace_premium),
+                        label: const Text(
+                          'استعراض باقات الاشتراك ووسائل الدفع المصرية',
                           style: TextStyle(fontWeight: FontWeight.bold),
                         ),
                       ),
@@ -2907,6 +4698,7 @@ class VerticalVideoFeedItemWidget extends StatefulWidget {
   final VoidCallback onLikeTap;
   final VoidCallback onRepeatPhraseTap;
   final VoidCallback onHeroActivityTap;
+  final VoidCallback onVoiceAssistantTap;
 
   const VerticalVideoFeedItemWidget({
     super.key,
@@ -2915,6 +4707,7 @@ class VerticalVideoFeedItemWidget extends StatefulWidget {
     required this.onLikeTap,
     required this.onRepeatPhraseTap,
     required this.onHeroActivityTap,
+    required this.onVoiceAssistantTap,
   });
 
   @override
@@ -3111,7 +4904,7 @@ class _VerticalVideoFeedItemWidgetState
               ),
             Positioned(
               left: 16,
-              bottom: 110,
+              bottom: 100,
               child: Column(
                 mainAxisSize: MainAxisSize.min,
                 children: [
@@ -3121,21 +4914,28 @@ class _VerticalVideoFeedItemWidgetState
                     label: '${item.likes}',
                     onTap: widget.onLikeTap,
                   ),
-                  const SizedBox(height: 16),
+                  const SizedBox(height: 14),
                   _SideActionButton(
                     icon: Icons.mic_rounded,
                     iconColor: const Color(0xFFF59E0B),
                     label: 'ردد معي',
                     onTap: widget.onRepeatPhraseTap,
                   ),
-                  const SizedBox(height: 16),
+                  const SizedBox(height: 14),
                   _SideActionButton(
                     icon: Icons.emoji_events_rounded,
                     iconColor: const Color(0xFF14B8A6),
                     label: 'نشاط البطل',
                     onTap: widget.onHeroActivityTap,
                   ),
-                  const SizedBox(height: 16),
+                  const SizedBox(height: 14),
+                  _SideActionButton(
+                    icon: Icons.assistant_rounded,
+                    iconColor: const Color(0xFF38BDF8),
+                    label: 'مساعد ذكي',
+                    onTap: widget.onVoiceAssistantTap,
+                  ),
+                  const SizedBox(height: 14),
                   _SideActionButton(
                     icon: _isMuted ? Icons.volume_off : Icons.volume_up,
                     iconColor: Colors.white,
@@ -3232,7 +5032,7 @@ class _VerticalVideoFeedItemWidgetState
                           const SizedBox(width: 6),
                           Flexible(
                             child: Text(
-                              item.repeatPhrase,
+                              'ردد معي بصوت هادئ: ${item.repeatPhrase}',
                               style: const TextStyle(
                                 fontSize: 13,
                                 fontWeight: FontWeight.bold,
@@ -3289,13 +5089,13 @@ class _SideActionButton extends StatelessWidget {
       child: Column(
         children: [
           Container(
-            padding: const EdgeInsets.all(12),
+            padding: const EdgeInsets.all(11),
             decoration: BoxDecoration(
               color: Colors.black.withOpacity(0.5),
               shape: BoxShape.circle,
               border: Border.all(color: Colors.white24),
             ),
-            child: Icon(icon, color: iconColor, size: 26),
+            child: Icon(icon, color: iconColor, size: 24),
           ),
           const SizedBox(height: 4),
           Text(
@@ -3312,10 +5112,14 @@ class _SideActionButton extends StatelessWidget {
   }
 }
 
-
 class ParentalStudioScreen extends StatefulWidget {
   final AppStateManager appState;
-  const ParentalStudioScreen({super.key, required this.appState});
+  final int initialTabIndex;
+  const ParentalStudioScreen({
+    super.key,
+    required this.appState,
+    this.initialTabIndex = 0,
+  });
 
   @override
   State<ParentalStudioScreen> createState() => _ParentalStudioScreenState();
@@ -3341,16 +5145,26 @@ class _ParentalStudioScreenState extends State<ParentalStudioScreen>
   String _newChildAvatar = '🐰';
   int _newChildDailyLimit = 20;
 
+  final TextEditingController _parentSuggestionInputCtrl =
+      TextEditingController();
+
   late TextEditingController _authApiCtrl;
+  late TextEditingController _emailWebhookCtrl;
   late TextEditingController _pinUpdateCtrl;
 
   @override
   void initState() {
     super.initState();
-    _tabController = TabController(length: 4, vsync: this);
+    _tabController = TabController(
+      length: 5,
+      vsync: this,
+      initialIndex: widget.initialTabIndex.clamp(0, 4),
+    );
     _remoteUrlCtrl =
         TextEditingController(text: widget.appState.remoteFeedUrl);
     _authApiCtrl = TextEditingController(text: widget.appState.authApiUrl);
+    _emailWebhookCtrl =
+        TextEditingController(text: widget.appState.emailWebhookUrl);
     _pinUpdateCtrl = TextEditingController(
         text: widget.appState.currentAccount?.parentalPin ?? '1234');
   }
@@ -3366,9 +5180,292 @@ class _ParentalStudioScreenState extends State<ParentalStudioScreen>
     _vActivityCtrl.dispose();
     _vEmojiCtrl.dispose();
     _newChildNameCtrl.dispose();
+    _parentSuggestionInputCtrl.dispose();
     _authApiCtrl.dispose();
+    _emailWebhookCtrl.dispose();
     _pinUpdateCtrl.dispose();
     super.dispose();
+  }
+
+  void _openEgyptianPaymentCheckoutSheet(SubscriptionPlanModel plan) {
+    if (plan.priceEgp == 0) {
+      widget.appState.activateOrResetOneDayTrial();
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('🎁 تم تفعيل الفترة التجريبية المجانية لمدة ٢٤ ساعة!'),
+          backgroundColor: Color(0xFF14B8A6),
+        ),
+      );
+      return;
+    }
+
+    EgyptianPaymentMethodInfo selectedMethod = kEgyptianPaymentMethods.first;
+    final TextEditingController walletOrIpaCtrl = TextEditingController();
+    final TextEditingController cardNumCtrl = TextEditingController();
+    final TextEditingController cardExpiryCtrl = TextEditingController();
+    final TextEditingController cardCvvCtrl = TextEditingController();
+    final TextEditingController otpCtrl = TextEditingController(text: '884210');
+    bool isProcessing = false;
+    String? checkoutError;
+
+    showModalBottomSheet(
+      context: context,
+      isScrollControlled: true,
+      backgroundColor: const Color(0xFF1E293B),
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(28)),
+      ),
+      builder: (ctx) {
+        return StatefulBuilder(
+          builder: (ctx, setModalState) {
+            final bool isCard = selectedMethod.id == 'visa_mastercard';
+            final bool isInstaPay = selectedMethod.id == 'instapay';
+
+            return Padding(
+              padding: EdgeInsets.only(
+                right: 22,
+                left: 22,
+                top: 22,
+                bottom: MediaQuery.of(ctx).viewInsets.bottom + 24,
+              ),
+              child: SingleChildScrollView(
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Row(
+                      mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                      children: [
+                        Expanded(
+                          child: Text(
+                            '💳 بوابة الدفع المصرية — ${plan.title}',
+                            style: const TextStyle(
+                              fontSize: 18,
+                              fontWeight: FontWeight.bold,
+                              color: Colors.white,
+                            ),
+                          ),
+                        ),
+                        Container(
+                          padding: const EdgeInsets.symmetric(
+                              horizontal: 12, vertical: 6),
+                          decoration: BoxDecoration(
+                            color: const Color(0xFFF59E0B).withOpacity(0.2),
+                            borderRadius: BorderRadius.circular(14),
+                          ),
+                          child: Text(
+                            '${plan.priceEgp} ج.م',
+                            style: const TextStyle(
+                              fontSize: 16,
+                              fontWeight: FontWeight.bold,
+                              color: Color(0xFFF59E0B),
+                            ),
+                          ),
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 12),
+                    const Text(
+                      'اختر وسيلة الدفع المفضلة لديك في مصر:',
+                      style: TextStyle(fontSize: 13, color: Colors.white70),
+                    ),
+                    const SizedBox(height: 10),
+                    ...kEgyptianPaymentMethods.map((method) {
+                      final isSelected = selectedMethod.id == method.id;
+                      return GestureDetector(
+                        onTap: () => setModalState(() {
+                          selectedMethod = method;
+                          checkoutError = null;
+                        }),
+                        child: Container(
+                          margin: const EdgeInsets.only(bottom: 8),
+                          padding: const EdgeInsets.all(12),
+                          decoration: BoxDecoration(
+                            color: isSelected
+                                ? method.brandColor.withOpacity(0.18)
+                                : const Color(0xFF0F172A),
+                            borderRadius: BorderRadius.circular(14),
+                            border: Border.all(
+                              color: isSelected
+                                  ? method.brandColor
+                                  : Colors.white12,
+                              width: isSelected ? 2 : 1,
+                            ),
+                          ),
+                          child: Row(
+                            children: [
+                              CircleAvatar(
+                                backgroundColor: method.brandColor,
+                                radius: 18,
+                                child: Icon(method.icon,
+                                    color: Colors.white, size: 20),
+                              ),
+                              const SizedBox(width: 12),
+                              Expanded(
+                                child: Column(
+                                  crossAxisAlignment: CrossAxisAlignment.start,
+                                  children: [
+                                    Text(
+                                      method.nameAr,
+                                      style: const TextStyle(
+                                        fontWeight: FontWeight.bold,
+                                        fontSize: 14,
+                                      ),
+                                    ),
+                                    Text(
+                                      method.subtitleAr,
+                                      style: const TextStyle(
+                                          fontSize: 11, color: Colors.white70),
+                                    ),
+                                  ],
+                                ),
+                              ),
+                              if (isSelected)
+                                const Icon(Icons.check_circle,
+                                    color: Color(0xFF14B8A6)),
+                            ],
+                          ),
+                        ),
+                      );
+                    }),
+                    const SizedBox(height: 12),
+                    if (!isCard) ...[
+                      TextField(
+                        controller: walletOrIpaCtrl,
+                        keyboardType: isInstaPay
+                            ? TextInputType.emailAddress
+                            : TextInputType.phone,
+                        decoration: InputDecoration(
+                          labelText: isInstaPay
+                              ? 'عنوان الدفع على إنستا باي (IPA) أو رقم الهاتف'
+                              : 'رقم محفظة ${selectedMethod.nameAr} (١١ رقماً)',
+                          hintText:
+                              isInstaPay ? 'name@instapay' : '01012345678',
+                          prefixIcon: Icon(selectedMethod.icon),
+                        ),
+                      ),
+                      const SizedBox(height: 10),
+                      TextField(
+                        controller: otpCtrl,
+                        keyboardType: TextInputType.number,
+                        decoration: const InputDecoration(
+                          labelText:
+                              'الرقم السري المتغير (OTP) أو رقم مرجع التحويل',
+                          prefixIcon: Icon(Icons.verified_user_outlined),
+                        ),
+                      ),
+                    ] else ...[
+                      TextField(
+                        controller: cardNumCtrl,
+                        keyboardType: TextInputType.number,
+                        decoration: const InputDecoration(
+                          labelText: 'رقم البطاقة البنكية (فيزا / ماستركارد / ميزة)',
+                          hintText: '4532 •••• •••• 8891',
+                          prefixIcon: Icon(Icons.credit_card),
+                        ),
+                      ),
+                      const SizedBox(height: 10),
+                      Row(
+                        children: [
+                          Expanded(
+                            child: TextField(
+                              controller: cardExpiryCtrl,
+                              decoration: const InputDecoration(
+                                labelText: 'تاريخ الانتهاء (MM/YY)',
+                                hintText: '08/29',
+                              ),
+                            ),
+                          ),
+                          const SizedBox(width: 10),
+                          Expanded(
+                            child: TextField(
+                              controller: cardCvvCtrl,
+                              obscureText: true,
+                              keyboardType: TextInputType.number,
+                              decoration: const InputDecoration(
+                                labelText: 'رمز CVV',
+                                hintText: '123',
+                              ),
+                            ),
+                          ),
+                        ],
+                      ),
+                    ],
+                    if (checkoutError != null) ...[
+                      const SizedBox(height: 10),
+                      Text(checkoutError!,
+                          style: const TextStyle(color: Colors.redAccent)),
+                    ],
+                    const SizedBox(height: 16),
+                    SizedBox(
+                      width: double.infinity,
+                      height: 52,
+                      child: ElevatedButton.icon(
+                        style: ElevatedButton.styleFrom(
+                          backgroundColor: selectedMethod.brandColor,
+                          foregroundColor: Colors.white,
+                          shape: RoundedRectangleBorder(
+                            borderRadius: BorderRadius.circular(16),
+                          ),
+                        ),
+                        onPressed: isProcessing
+                            ? null
+                            : () async {
+                                final String payerId = isCard
+                                    ? cardNumCtrl.text.trim()
+                                    : walletOrIpaCtrl.text.trim();
+                                if (payerId.length < 4) {
+                                  setModalState(() {
+                                    checkoutError = isCard
+                                        ? 'يرجى إدخال رقم البطاقة البنكية بشكل صحيح.'
+                                        : 'يرجى إدخال رقم المحفظة أو عنوان إنستا باي لإتمام الدفع.';
+                                  });
+                                  return;
+                                }
+                                setModalState(() {
+                                  isProcessing = true;
+                                  checkoutError = null;
+                                });
+                                await Future.delayed(
+                                    const Duration(milliseconds: 900));
+                                final tx = await widget.appState
+                                    .processEgyptianSubscriptionPayment(
+                                  plan: plan,
+                                  method: selectedMethod,
+                                  payerIdentifier: payerId,
+                                );
+                                if (ctx.mounted) {
+                                  Navigator.pop(ctx);
+                                  if (tx != null) {
+                                    ScaffoldMessenger.of(context).showSnackBar(
+                                      SnackBar(
+                                        content: Text(
+                                            '✅ تم الدفع وتفعيل ${plan.title} بنجاح! رقم المرجع: ${tx.referenceCode} (أرسلنا الإيصال لإيميلك)'),
+                                        backgroundColor:
+                                            const Color(0xFF14B8A6),
+                                      ),
+                                    );
+                                  }
+                                }
+                              },
+                        icon: const Icon(Icons.lock_outline),
+                        label: Text(
+                          isProcessing
+                              ? 'جاري تأكيد عملية الدفع...'
+                              : 'تأكيد دفع ${plan.priceEgp} ج.م عبر ${selectedMethod.nameAr}',
+                          style: const TextStyle(
+                              fontWeight: FontWeight.bold, fontSize: 14),
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            );
+          },
+        );
+      },
+    );
   }
 
   void _submitManualVideoForm() {
@@ -3486,13 +5583,14 @@ class _ParentalStudioScreenState extends State<ParentalStudioScreen>
                       const SizedBox(width: 12),
                       DropdownButton<String>(
                         value: editAvatar,
-                        items: ['🦁', '🦋', '🐰', '🐼', '🚀', '🌸', '🐬', '🦊']
-                            .map((e) => DropdownMenuItem(
-                                  value: e,
-                                  child: Text(e,
-                                      style: const TextStyle(fontSize: 24)),
-                                ))
-                            .toList(),
+                        items:
+                            ['🦁', '🦋', '🐰', '🐼', '🚀', '🌸', '🐬', '🦊']
+                                .map((e) => DropdownMenuItem(
+                                      value: e,
+                                      child: Text(e,
+                                          style: const TextStyle(fontSize: 24)),
+                                    ))
+                                .toList(),
                         onChanged: (v) {
                           if (v != null) setModalState(() => editAvatar = v);
                         },
@@ -3555,7 +5653,7 @@ class _ParentalStudioScreenState extends State<ParentalStudioScreen>
           appBar: AppBar(
             backgroundColor: const Color(0xFF1E293B),
             title: const Text(
-              'بوابة الوالدين واستوديو الفيديوهات',
+              'بوابة الوالدين واستوديو حنين كيدز',
               style: TextStyle(fontSize: 17, fontWeight: FontWeight.bold),
             ),
             bottom: TabBar(
@@ -3569,8 +5667,11 @@ class _ParentalStudioScreenState extends State<ParentalStudioScreen>
                     icon: Icon(Icons.cloud_download_outlined),
                     text: 'استقبال الفيديوهات'),
                 Tab(
-                    icon: Icon(Icons.timer_outlined),
-                    text: 'وقت الشاشة والتقارير'),
+                    icon: Icon(Icons.workspace_premium_outlined),
+                    text: 'الاشتراكات والدفع المصري'),
+                Tab(
+                    icon: Icon(Icons.mark_email_read_outlined),
+                    text: 'تنبيهات الإيميل والوقت'),
                 Tab(icon: Icon(Icons.child_care), text: 'ملفات الأطفال'),
                 Tab(
                     icon: Icon(Icons.manage_accounts_outlined),
@@ -3868,6 +5969,414 @@ class _ParentalStudioScreenState extends State<ParentalStudioScreen>
                   Container(
                     padding: const EdgeInsets.all(18),
                     decoration: BoxDecoration(
+                      gradient: const LinearGradient(
+                        colors: [Color(0xFF134E4A), Color(0xFF1E293B)],
+                      ),
+                      borderRadius: BorderRadius.circular(18),
+                      border: Border.all(color: const Color(0xFF14B8A6)),
+                    ),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Row(
+                          children: [
+                            const Icon(Icons.verified_rounded,
+                                color: Color(0xFFF59E0B), size: 28),
+                            const SizedBox(width: 10),
+                            Expanded(
+                              child: Text(
+                                account.subscriptionStatusLabel,
+                                style: const TextStyle(
+                                  fontSize: 16,
+                                  fontWeight: FontWeight.bold,
+                                  color: Colors.white,
+                                ),
+                              ),
+                            ),
+                          ],
+                        ),
+                        const SizedBox(height: 8),
+                        Text(
+                          'تاريخ انتهاء الصلاحية: ${account.subscriptionExpiryDate.toLocal().toString().substring(0, 16)}',
+                          style: const TextStyle(
+                              fontSize: 12, color: Colors.white70),
+                        ),
+                      ],
+                    ),
+                  ),
+                  const SizedBox(height: 18),
+                  const Text(
+                    '💎 باقات الاشتراك المرنة والجذابة للعائلات',
+                    style: TextStyle(fontSize: 17, fontWeight: FontWeight.bold),
+                  ),
+                  const SizedBox(height: 6),
+                  const Text(
+                    'ادعم طفلك بمحتوى آمن وفصيح واختر الباقة المناسبة مع الدفع الفوري بجميع وسائل الدفع في مصر:',
+                    style: TextStyle(fontSize: 13, color: Colors.white70),
+                  ),
+                  const SizedBox(height: 14),
+                  ...kSubscriptionPlans.map((plan) {
+                    final bool isCurrentPlan =
+                        account.subscriptionPlanId == plan.id &&
+                            account.isSubscriptionActive;
+                    return Container(
+                      margin: const EdgeInsets.only(bottom: 14),
+                      padding: const EdgeInsets.all(18),
+                      decoration: BoxDecoration(
+                        color: const Color(0xFF1E293B),
+                        borderRadius: BorderRadius.circular(20),
+                        border: Border.all(
+                          color: plan.isPopular
+                              ? const Color(0xFFF59E0B)
+                              : plan.accentColor.withOpacity(0.6),
+                          width: plan.isPopular ? 2.2 : 1.2,
+                        ),
+                      ),
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Row(
+                            mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                            children: [
+                              Container(
+                                padding: const EdgeInsets.symmetric(
+                                    horizontal: 10, vertical: 4),
+                                decoration: BoxDecoration(
+                                  color: plan.accentColor.withOpacity(0.2),
+                                  borderRadius: BorderRadius.circular(12),
+                                ),
+                                child: Text(
+                                  plan.badge,
+                                  style: TextStyle(
+                                    fontSize: 12,
+                                    fontWeight: FontWeight.bold,
+                                    color: plan.accentColor,
+                                  ),
+                                ),
+                              ),
+                              if (plan.priceEgp > 0)
+                                Row(
+                                  children: [
+                                    if (plan.originalPriceEgp > plan.priceEgp)
+                                      Text(
+                                        '${plan.originalPriceEgp} ج.م',
+                                        style: const TextStyle(
+                                          fontSize: 12,
+                                          color: Colors.white38,
+                                          decoration:
+                                              TextDecoration.lineThrough,
+                                        ),
+                                      ),
+                                    const SizedBox(width: 6),
+                                    Text(
+                                      '${plan.priceEgp} ج.م',
+                                      style: const TextStyle(
+                                        fontSize: 20,
+                                        fontWeight: FontWeight.bold,
+                                        color: Color(0xFFF59E0B),
+                                      ),
+                                    ),
+                                  ],
+                                )
+                              else
+                                const Text(
+                                  'مجاناً (٢٤ ساعة)',
+                                  style: TextStyle(
+                                    fontSize: 17,
+                                    fontWeight: FontWeight.bold,
+                                    color: Color(0xFF38BDF8),
+                                  ),
+                                ),
+                            ],
+                          ),
+                          const SizedBox(height: 10),
+                          Text(
+                            plan.title,
+                            style: const TextStyle(
+                              fontSize: 18,
+                              fontWeight: FontWeight.bold,
+                              color: Colors.white,
+                            ),
+                          ),
+                          const SizedBox(height: 4),
+                          Text(
+                            plan.subtitle,
+                            style: const TextStyle(
+                                fontSize: 13, color: Colors.white70),
+                          ),
+                          const SizedBox(height: 10),
+                          ...plan.features.map(
+                            (f) => Padding(
+                              padding: const EdgeInsets.only(bottom: 4),
+                              child: Row(
+                                children: [
+                                  Icon(Icons.check_circle_outline,
+                                      size: 16, color: plan.accentColor),
+                                  const SizedBox(width: 6),
+                                  Expanded(
+                                    child: Text(
+                                      f,
+                                      style: const TextStyle(
+                                          fontSize: 12, color: Colors.white),
+                                    ),
+                                  ),
+                                ],
+                              ),
+                            ),
+                          ),
+                          const SizedBox(height: 12),
+                          SizedBox(
+                            width: double.infinity,
+                            height: 46,
+                            child: ElevatedButton.icon(
+                              style: ElevatedButton.styleFrom(
+                                backgroundColor: isCurrentPlan
+                                    ? const Color(0xFF334155)
+                                    : plan.accentColor,
+                                foregroundColor: Colors.white,
+                                shape: RoundedRectangleBorder(
+                                  borderRadius: BorderRadius.circular(14),
+                                ),
+                              ),
+                              onPressed: () =>
+                                  _openEgyptianPaymentCheckoutSheet(plan),
+                              icon: Icon(isCurrentPlan
+                                  ? Icons.autorenew
+                                  : Icons.payment_rounded),
+                              label: Text(
+                                isCurrentPlan
+                                    ? 'الباقة النشطة حالياً (تمديد إضافي)'
+                                    : plan.priceEgp == 0
+                                        ? 'تفعيل التجربة المجانية ليوم كامل'
+                                        : 'اشترك الآن وادفع بالوسائل المصرية',
+                                style: const TextStyle(
+                                    fontWeight: FontWeight.bold),
+                              ),
+                            ),
+                          ),
+                        ],
+                      ),
+                    );
+                  }),
+                  const SizedBox(height: 14),
+                  const Text(
+                    '🇪🇬 وسائل الدفع المصرية المتاحة والمعتمدة داخل التطبيق:',
+                    style: TextStyle(fontSize: 15, fontWeight: FontWeight.bold),
+                  ),
+                  const SizedBox(height: 8),
+                  Wrap(
+                    spacing: 8,
+                    runSpacing: 8,
+                    children: kEgyptianPaymentMethods.map((m) {
+                      return Chip(
+                        backgroundColor: m.brandColor.withOpacity(0.2),
+                        avatar: Icon(m.icon, size: 16, color: m.brandColor),
+                        label: Text(
+                          m.nameAr,
+                          style: const TextStyle(fontSize: 12),
+                        ),
+                      );
+                    }).toList(),
+                  ),
+                  if (account.paymentHistory.isNotEmpty) ...[
+                    const SizedBox(height: 20),
+                    const Text(
+                      '🧾 سجل إيصالات الدفع السابقة:',
+                      style:
+                          TextStyle(fontSize: 16, fontWeight: FontWeight.bold),
+                    ),
+                    const SizedBox(height: 8),
+                    ...account.paymentHistory.map((tx) {
+                      return Card(
+                        color: const Color(0xFF1E293B),
+                        margin: const EdgeInsets.only(bottom: 8),
+                        child: ListTile(
+                          leading: const Icon(Icons.receipt_long,
+                              color: Color(0xFF14B8A6)),
+                          title: Text(
+                            '${tx.planTitle} — ${tx.amountEgp} ج.م',
+                            style: const TextStyle(fontWeight: FontWeight.bold),
+                          ),
+                          subtitle: Text(
+                            'الوسيلة: ${tx.paymentMethodName}\nالمرجع: ${tx.referenceCode} • الحساب: ${tx.payerIdentifier}',
+                            style: const TextStyle(
+                                fontSize: 12, color: Colors.white70),
+                          ),
+                        ),
+                      );
+                    }),
+                  ],
+                ],
+              ),
+
+              ListView(
+                padding: const EdgeInsets.all(20),
+                children: [
+                  Container(
+                    padding: const EdgeInsets.all(18),
+                    decoration: BoxDecoration(
+                      color: const Color(0xFF1E293B),
+                      borderRadius: BorderRadius.circular(18),
+                      border: Border.all(color: const Color(0xFFF59E0B)),
+                    ),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Row(
+                          children: [
+                            const Icon(Icons.mark_email_unread_rounded,
+                                color: Color(0xFFF59E0B)),
+                            const SizedBox(width: 8),
+                            Expanded(
+                              child: Text(
+                                'نظام تنبيهات الإيميل والاقتراحات للآباء (${account.emailOrPhone})',
+                                style: const TextStyle(
+                                  fontSize: 15,
+                                  fontWeight: FontWeight.bold,
+                                ),
+                              ),
+                            ),
+                          ],
+                        ),
+                        const SizedBox(height: 10),
+                        Container(
+                          padding: const EdgeInsets.all(12),
+                          decoration: BoxDecoration(
+                            color: const Color(0xFF0F172A),
+                            borderRadius: BorderRadius.circular(12),
+                          ),
+                          child: Text(
+                            widget.appState.generateSmartParentRecommendation(),
+                            style: const TextStyle(
+                              fontSize: 13,
+                              height: 1.5,
+                              color: Color(0xFFFDE68A),
+                            ),
+                          ),
+                        ),
+                        const SizedBox(height: 12),
+                        SwitchListTile(
+                          contentPadding: EdgeInsets.zero,
+                          value: account.emailNotificationsEnabled,
+                          activeColor: const Color(0xFF14B8A6),
+                          onChanged:
+                              widget.appState.toggleParentEmailNotifications,
+                          title: const Text(
+                            'إرسال تقارير وتنبيهات على الإيميل تلقائياً',
+                            style: TextStyle(
+                                fontSize: 14, fontWeight: FontWeight.bold),
+                          ),
+                          subtitle: const Text(
+                            'يرسل تنبيهاً عند انتهاء وقت الشاشة وعند إنجاز الطفل للنجوم والأنشطة',
+                            style:
+                                TextStyle(fontSize: 12, color: Colors.white70),
+                          ),
+                        ),
+                        SwitchListTile(
+                          contentPadding: EdgeInsets.zero,
+                          value: account.dailySmartSuggestionsEnabled,
+                          activeColor: const Color(0xFFF59E0B),
+                          onChanged:
+                              widget.appState.toggleDailySmartSuggestions,
+                          title: const Text(
+                            'اقتراحات ذكية يومية لتحسين تجربة الطفل',
+                            style: TextStyle(
+                                fontSize: 14, fontWeight: FontWeight.bold),
+                          ),
+                        ),
+                        const SizedBox(height: 8),
+                        SizedBox(
+                          width: double.infinity,
+                          child: ElevatedButton.icon(
+                            style: ElevatedButton.styleFrom(
+                              backgroundColor: const Color(0xFF14B8A6),
+                              foregroundColor: Colors.white,
+                            ),
+                            onPressed: () async {
+                              await widget.appState.sendParentEmailAlert(
+                                subject:
+                                    '📊 تقرير أداء واقتراح ذكي من تطبيق حنين كيدز (${activeChild.name})',
+                                bodyMessage:
+                                    'شاهد ${activeChild.name} اليوم ${activeChild.usedMinutesToday} دقيقة، وحقق ${activeChild.starsEarned} نجوم، وأتقن ${activeChild.correctPronunciationsCount} جمل عربية فصيحة.',
+                              );
+                              if (context.mounted) {
+                                ScaffoldMessenger.of(context).showSnackBar(
+                                  SnackBar(
+                                    content: Text(
+                                        '📧 تم إرسال التقرير والاقتراح الذكي إلى الإيميل: ${account.emailOrPhone}'),
+                                    backgroundColor: const Color(0xFF14B8A6),
+                                  ),
+                                );
+                              }
+                            },
+                            icon: const Icon(Icons.send_rounded),
+                            label: const Text(
+                                'إرسال تقرير واقتراح ذكي إلى إيميلي الآن'),
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                  const SizedBox(height: 16),
+                  Container(
+                    padding: const EdgeInsets.all(18),
+                    decoration: BoxDecoration(
+                      color: const Color(0xFF1E293B),
+                      borderRadius: BorderRadius.circular(18),
+                    ),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        const Text(
+                          '💡 شاركنا اقتراحك لتحسين تجربة تطبيق حنين كيدز',
+                          style: TextStyle(
+                              fontSize: 15, fontWeight: FontWeight.bold),
+                        ),
+                        const SizedBox(height: 8),
+                        TextField(
+                          controller: _parentSuggestionInputCtrl,
+                          maxLines: 2,
+                          decoration: const InputDecoration(
+                            labelText: 'اكتب أي فكرة أو قصة تود إضافتها لطفلك',
+                            hintText:
+                                'مثال: نرغب في قصص عن بر الوالدين أو تعلم الأرقام بالعربية...',
+                          ),
+                        ),
+                        const SizedBox(height: 10),
+                        Align(
+                          alignment: Alignment.centerLeft,
+                          child: OutlinedButton.icon(
+                            onPressed: () async {
+                              final text =
+                                  _parentSuggestionInputCtrl.text.trim();
+                              if (text.isEmpty) return;
+                              await widget.appState.sendParentEmailAlert(
+                                subject:
+                                    '💌 تأكيد استلام اقتراحك لتطوير حنين كيدز',
+                                bodyMessage:
+                                    'شكراً لمشاركتنا اقتراحك: «$text». سيقوم فريق المحتوى التربوي بمراجعته وإدراجه في التحديث القادم.',
+                              );
+                              _parentSuggestionInputCtrl.clear();
+                              if (context.mounted) {
+                                ScaffoldMessenger.of(context).showSnackBar(
+                                  const SnackBar(
+                                    content: Text(
+                                        '✅ تم إرسال اقتراحك وتأكيده عبر الإيميل!'),
+                                  ),
+                                );
+                              }
+                            },
+                            icon: const Icon(Icons.lightbulb_outline),
+                            label: const Text('إرسال الاقتراح'),
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                  const SizedBox(height: 16),
+                  Container(
+                    padding: const EdgeInsets.all(18),
+                    decoration: BoxDecoration(
                       color: const Color(0xFF1E293B),
                       borderRadius: BorderRadius.circular(18),
                     ),
@@ -3914,84 +6423,50 @@ class _ParentalStudioScreenState extends State<ParentalStudioScreen>
                     ),
                   ),
                   const SizedBox(height: 16),
-                  Container(
-                    padding: const EdgeInsets.all(18),
-                    decoration: BoxDecoration(
-                      color: const Color(0xFF1E293B),
-                      borderRadius: BorderRadius.circular(18),
-                    ),
-                    child: SwitchListTile(
-                      value: account.warmEveningFilter,
-                      activeColor: const Color(0xFFF59E0B),
-                      onChanged: (val) =>
-                          widget.appState.toggleWarmEveningFilter(val),
-                      title: const Text(
-                        '🌙 فلتر المساء الدافئ (تقليل الإضاءة الزرقاء)',
-                        style: TextStyle(fontWeight: FontWeight.bold),
-                      ),
-                      subtitle: const Text(
-                        'يضيف طبقة كهرمانية دافئة مريحة للعينين قبل النوم.',
-                        style: TextStyle(color: Colors.white70, fontSize: 13),
-                      ),
-                    ),
-                  ),
-                  const SizedBox(height: 16),
                   const Text(
-                    '📊 تقارير أداء وتفاعل الأطفال',
-                    style: TextStyle(fontSize: 17, fontWeight: FontWeight.bold),
+                    '📬 سجل رسائل الإيميل والتنبيهات المرسلة للوالدين:',
+                    style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold),
                   ),
-                  const SizedBox(height: 10),
-                  ...account.children.map((c) {
+                  const SizedBox(height: 8),
+                  ...account.emailAlertsLog.map((alert) {
                     return Card(
                       color: const Color(0xFF1E293B),
-                      margin: const EdgeInsets.only(bottom: 12),
+                      margin: const EdgeInsets.only(bottom: 10),
                       shape: RoundedRectangleBorder(
-                        borderRadius: BorderRadius.circular(16),
+                        borderRadius: BorderRadius.circular(14),
                       ),
                       child: Padding(
-                        padding: const EdgeInsets.all(16),
+                        padding: const EdgeInsets.all(14),
                         child: Column(
                           crossAxisAlignment: CrossAxisAlignment.start,
                           children: [
-                            Row(
-                              children: [
-                                Text(c.chosenAvatar,
-                                    style: const TextStyle(fontSize: 30)),
-                                const SizedBox(width: 10),
-                                Expanded(
-                                  child: Text(
-                                    '${c.name} (${c.age})',
-                                    style: const TextStyle(
-                                      fontSize: 16,
-                                      fontWeight: FontWeight.bold,
-                                    ),
-                                  ),
-                                ),
-                                Container(
-                                  padding: const EdgeInsets.symmetric(
-                                      horizontal: 10, vertical: 4),
-                                  decoration: BoxDecoration(
-                                    color:
-                                        const Color(0xFFF59E0B).withOpacity(0.2),
-                                    borderRadius: BorderRadius.circular(12),
-                                  ),
-                                  child: Text(
-                                    '⭐ ${c.starsEarned} نجوم',
-                                    style: const TextStyle(
-                                      color: Color(0xFFF59E0B),
-                                      fontWeight: FontWeight.bold,
-                                    ),
-                                  ),
-                                ),
-                              ],
-                            ),
-                            const SizedBox(height: 10),
                             Text(
-                              '• وقت المشاهدة اليوم: ${c.usedMinutesToday} / ${c.dailyTimeLimit} دقيقة\n'
-                              '• الأنشطة والجمل الفصيحة المنجزة: ${c.completedActivities.length} مهمة\n'
-                              '• القصص المفضلة: ${c.likedVideoIds.length} قصة',
+                              alert.subject,
                               style: const TextStyle(
-                                  color: Colors.white70, height: 1.5),
+                                fontWeight: FontWeight.bold,
+                                fontSize: 14,
+                                color: Color(0xFF14B8A6),
+                              ),
+                            ),
+                            const SizedBox(height: 4),
+                            Text(
+                              'إلى: ${alert.recipientEmail} • ${alert.sentAt.toLocal().toString().substring(0, 16)}',
+                              style: const TextStyle(
+                                  fontSize: 11, color: Colors.white54),
+                            ),
+                            const SizedBox(height: 8),
+                            Text(
+                              alert.bodyMessage,
+                              style: const TextStyle(
+                                  fontSize: 13, color: Colors.white),
+                            ),
+                            const SizedBox(height: 6),
+                            Text(
+                              alert.smartImprovementSuggestion,
+                              style: const TextStyle(
+                                fontSize: 12,
+                                color: Color(0xFFFDE68A),
+                              ),
                             ),
                           ],
                         ),
@@ -4023,7 +6498,8 @@ class _ParentalStudioScreenState extends State<ParentalStudioScreen>
                         ),
                       ),
                       child: ListTile(
-                        onTap: () => widget.appState.switchActiveChild(child.id),
+                        onTap: () =>
+                            widget.appState.switchActiveChild(child.id),
                         leading: Text(child.chosenAvatar,
                             style: const TextStyle(fontSize: 32)),
                         title: Text(
@@ -4031,7 +6507,7 @@ class _ParentalStudioScreenState extends State<ParentalStudioScreen>
                           style: const TextStyle(fontWeight: FontWeight.bold),
                         ),
                         subtitle: Text(
-                          'الحصة اليومية: ${child.dailyTimeLimit} دقيقة • ⭐ ${child.starsEarned}',
+                          'الحصة اليومية: ${child.dailyTimeLimit} دقيقة • ⭐ ${child.starsEarned} • فصاحة: ${child.correctPronunciationsCount}',
                           style: const TextStyle(color: Colors.white70),
                         ),
                         trailing: Row(
@@ -4194,11 +6670,27 @@ class _ParentalStudioScreenState extends State<ParentalStudioScreen>
                             ),
                           ),
                           subtitle: Text(
-                            'البريد / الهاتف: ${account.emailOrPhone}\nالرمز الأبوي الحالي (PIN): ${account.parentalPin}',
+                            'البريد / الهاتف: ${account.emailOrPhone}\nطريقة الدخول: ${account.authProvider == 'google' ? 'حساب Google الموثق' : 'بريد إلكتروني'}\nالرمز الأبوي الحالي (PIN): ${account.parentalPin}',
                             style: const TextStyle(color: Colors.white70),
                           ),
                         ),
-                        const Divider(color: Colors.white12, height: 28),
+                        const Divider(color: Colors.white12, height: 24),
+                        SwitchListTile(
+                          contentPadding: EdgeInsets.zero,
+                          value: account.voiceAssistantEnabled,
+                          activeColor: const Color(0xFF14B8A6),
+                          onChanged: widget.appState.toggleVoiceAssistant,
+                          title: const Text(
+                            '🤖 تفعيل المساعد الصوتي الذكي للطفل',
+                            style: TextStyle(fontWeight: FontWeight.bold),
+                          ),
+                          subtitle: const Text(
+                            'يقدم تنبيهات صوتية هادئة واقتراحات قصص مناسبة للطفل',
+                            style:
+                                TextStyle(fontSize: 12, color: Colors.white70),
+                          ),
+                        ),
+                        const Divider(color: Colors.white12, height: 24),
                         const Text(
                           '🔐 تحديث الرمز السري الأبوي (PIN من 4 أرقام)',
                           style: TextStyle(
@@ -4242,33 +6734,34 @@ class _ParentalStudioScreenState extends State<ParentalStudioScreen>
                         ),
                         const Divider(color: Colors.white12, height: 28),
                         const Text(
-                          '🌐 رابط سيرفر المصادقة الخارجي (اختياري)',
+                          '📧 رابط سيرفر إرسال تنبيهات الإيميل (Webhook / Email API اختياري)',
                           style: TextStyle(
-                              fontWeight: FontWeight.bold, fontSize: 14),
+                              fontWeight: FontWeight.bold, fontSize: 13),
                         ),
                         const SizedBox(height: 8),
                         TextField(
-                          controller: _authApiCtrl,
+                          controller: _emailWebhookCtrl,
                           decoration: const InputDecoration(
-                            labelText: 'Auth REST API Base URL',
-                            hintText: 'https://api.yourdomain.com/auth',
-                            prefixIcon: Icon(Icons.api),
+                            labelText: 'Email Notification Webhook URL',
+                            hintText: 'https://api.yourdomain.com/email-alerts',
+                            prefixIcon: Icon(Icons.mark_email_read_outlined),
                           ),
                         ),
-                        const SizedBox(height: 10),
+                        const SizedBox(height: 8),
                         Align(
                           alignment: Alignment.centerLeft,
                           child: OutlinedButton(
                             onPressed: () {
-                              widget.appState
-                                  .updateAuthApiUrl(_authApiCtrl.text);
+                              widget.appState.updateEmailWebhookUrl(
+                                  _emailWebhookCtrl.text);
                               ScaffoldMessenger.of(context).showSnackBar(
                                 const SnackBar(
-                                  content: Text('تم حفظ رابط سيرفر المصادقة'),
+                                  content:
+                                      Text('تم حفظ رابط سيرفر تنبيهات الإيميل'),
                                 ),
                               );
                             },
-                            child: const Text('حفظ إعداد السيرفر'),
+                            child: const Text('حفظ إعداد الإيميل'),
                           ),
                         ),
                       ],
